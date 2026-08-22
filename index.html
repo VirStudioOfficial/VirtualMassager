@@ -28,14 +28,18 @@
   <section id="appView" class="app hidden">
     <aside class="sidebar">
       <header class="sidebar-header">
-        <div>
-          <strong>پیام‌ها</strong>
-          <small id="myUsername"></small>
+        <div class="me">
+          <div class="avatar me-avatar" id="myAvatar"></div>
+          <div>
+            <strong id="myDisplayName"></strong>
+            <small id="myUsername"></small>
+          </div>
         </div>
         <button id="logoutButton" class="icon-button" title="خروج">↪</button>
       </header>
 
       <div class="search-box">
+        <span class="search-icon">🔍</span>
         <input id="userSearch" type="text" placeholder="جستجوی کاربر...">
       </div>
       <div id="searchResults" class="search-results"></div>
@@ -44,19 +48,34 @@
 
     <main class="chat-panel">
       <header id="chatHeader" class="chat-header">
-        <div>
+        <button id="backButton" class="icon-button back-button hidden" title="بازگشت">→</button>
+        <div class="avatar chat-header-avatar hidden" id="chatHeaderAvatar"></div>
+        <div class="chat-header-info">
           <strong id="chatTitle">یک گفتگو انتخاب کن</strong>
           <small id="chatStatus"></small>
         </div>
       </header>
 
       <div id="messages" class="messages">
-        <div class="empty-state">از سمت چپ یک گفتگو انتخاب کن 👈</div>
+        <div class="empty-state">از سمت راست یک گفتگو انتخاب کن 👉</div>
+      </div>
+
+      <div id="attachmentPreview" class="attachment-preview hidden">
+        <div class="attachment-preview-inner">
+          <img id="attachmentPreviewImg" class="hidden" alt="پیش‌نمایش">
+          <div id="attachmentPreviewFile" class="attachment-file-chip hidden">
+            <span>📎</span>
+            <span id="attachmentPreviewName"></span>
+          </div>
+          <button id="removeAttachment" type="button" class="icon-button">✕</button>
+        </div>
       </div>
 
       <form id="messageForm" class="message-form hidden">
+        <input id="fileInput" type="file" accept="image/*,.pdf,.zip,.rar,.txt,.doc,.docx" hidden>
+        <button id="attachButton" type="button" class="icon-button" title="پیوست فایل">📎</button>
         <input id="messageInput" autocomplete="off" placeholder="پیامت رو بنویس...">
-        <button type="submit">ارسال</button>
+        <button id="sendButton" type="submit" class="send-button" title="ارسال">➤</button>
       </form>
     </main>
   </section>
@@ -70,6 +89,10 @@
         <button id="saveEdit" type="button">ذخیره</button>
       </div>
     </div>
+  </div>
+
+  <div id="imageViewer" class="image-viewer hidden">
+    <img id="imageViewerImg" alt="عکس">
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
