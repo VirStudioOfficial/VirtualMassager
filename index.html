@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>My Messenger</title>
+  <title>Virtual Messenger</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -12,7 +12,7 @@
   <section id="authView" class="auth-view">
     <div class="auth-card">
       <div class="logo">💬</div>
-      <h1>My Messenger</h1>
+      <h1>Virtual Messenger</h1>
       <p id="authSubtitle">وارد حساب خودت شو</p>
 
       <form id="authForm">
@@ -28,14 +28,17 @@
   <section id="appView" class="app hidden">
     <aside class="sidebar">
       <header class="sidebar-header">
-        <div class="me">
+        <div class="me" id="openSettings" title="تنظیمات پروفایل">
           <div class="avatar me-avatar" id="myAvatar"></div>
           <div>
             <strong id="myDisplayName"></strong>
             <small id="myUsername"></small>
           </div>
         </div>
-        <button id="logoutButton" class="icon-button" title="خروج">↪</button>
+        <div class="header-actions">
+          <button id="settingsButton" class="icon-button" title="تنظیمات">⚙</button>
+          <button id="logoutButton" class="icon-button" title="خروج">↪</button>
+        </div>
       </header>
 
       <div class="search-box">
@@ -93,6 +96,45 @@
 
   <div id="imageViewer" class="image-viewer hidden">
     <img id="imageViewerImg" alt="عکس">
+  </div>
+
+  <div id="settingsModal" class="modal hidden">
+    <div class="modal-card settings-card">
+      <div class="settings-header">
+        <h3>تنظیمات پروفایل</h3>
+        <button id="closeSettings" class="icon-button" type="button">✕</button>
+      </div>
+
+      <div class="settings-avatar-row">
+        <div class="avatar settings-avatar" id="settingsAvatarPreview"></div>
+        <div class="settings-avatar-actions">
+          <button id="uploadAvatarBtn" type="button" class="ghost-button">تغییر آواتار</button>
+          <button id="removeAvatarBtn" type="button" class="ghost-button danger-text">حذف آواتار</button>
+          <input id="avatarInput" type="file" accept="image/*" hidden>
+        </div>
+      </div>
+
+      <label class="settings-label">نام نمایشی</label>
+      <input id="settingsDisplayName" type="text" maxlength="30" placeholder="نام نمایشی">
+
+      <label class="settings-label">وضعیت</label>
+      <input id="settingsStatus" type="text" maxlength="40" placeholder="مثلاً: سرم شلوغه، بعداً جواب می‌دم">
+
+      <label class="settings-label">بایو</label>
+      <textarea id="settingsBio" maxlength="160" placeholder="چند خط درباره‌ی خودت..."></textarea>
+      <small class="char-count"><span id="bioCharCount">0</span>/۱۶۰</small>
+
+      <div class="settings-divider"></div>
+
+      <label class="settings-label">تغییر رمز عبور</label>
+      <input id="settingsNewPassword" type="password" placeholder="رمز عبور جدید (حداقل ۶ کاراکتر)" minlength="6" autocomplete="new-password">
+      <input id="settingsConfirmPassword" type="password" placeholder="تکرار رمز عبور جدید" minlength="6" autocomplete="new-password">
+
+      <div class="modal-actions">
+        <button id="cancelSettings" type="button">لغو</button>
+        <button id="saveSettings" type="button">ذخیره تغییرات</button>
+      </div>
+    </div>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
