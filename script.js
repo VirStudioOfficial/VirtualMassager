@@ -41,6 +41,8 @@ let remoteStream = null;
 let currentCallId = null;
 let currentCallType = null; // 'voice' | 'video'
 let callSignalsChannel = null;
+let callStatusChannel = null;
+let ringTimeoutId = null;
 let incomingCallsChannel = null;
 let isMuted = false;
 let isCameraOff = false;
@@ -100,7 +102,7 @@ function initials(name = "?") {
 
 function avatarHtml(profile, size) {
   if (profile?.avatar_url) {
-    return `<img src="${escapeHtml(profile.avatar_url)}" alt="">`;
+    return `<img src="${escapeHtml(profile.avatar_url)}" alt="" loading="lazy" decoding="async">`;
   }
   return initials(profile?.display_name || profile?.username || "?");
 }
@@ -198,6 +200,7 @@ function cleanupAllChannels() {
   if (typingChannel) { sb.removeChannel(typingChannel); typingChannel = null; }
   if (onlineChannel) { sb.removeChannel(onlineChannel); onlineChannel = null; }
   if (callSignalsChannel) { sb.removeChannel(callSignalsChannel); callSignalsChannel = null; }
+  if (callStatusChannel) { sb.removeChannel(callStatusChannel); callStatusChannel = null; }
   if (incomingCallsChannel) { sb.removeChannel(incomingCallsChannel); incomingCallsChannel = null; }
   clearTimeout(typingPingTimer);
   clearTimeout(typingStaleTimer);
@@ -238,9 +241,14 @@ async function handleSession(session) {
   authView.classList.add("hidden");
   appView.classList.remove("hidden");
 
-  await ensureProfile();
-  await loadChats();
-  await startPresence();
+  // These three don't depend on each other's results, so run them
+  // concurrently instead of one-after-another — was adding up to a
+  // noticeably slower "stuck on load" feel, especially on slower connections.
+  await Promise.all([
+    ensureProfile(),
+    loadChats(),
+    startPresence()
+  ]);
   subscribeToIncomingCalls();
 }
 
@@ -730,7 +738,7 @@ function renderMessage(message) {
   let mediaHtml = "";
   if (message.attachment_url) {
     if (message.attachment_type === "image") {
-      mediaHtml = `<img class="message-image" src="${escapeHtml(message.attachment_url)}" data-view-image="${escapeHtml(message.attachment_url)}" alt="عکس">`;
+      mediaHtml = `<img class="message-image" src="${escapeHtml(message.attachment_url)}" data-view-image="${escapeHtml(message.attachment_url)}" alt="عکس" loading="lazy" decoding="async">`;
     } else {
       mediaHtml = `
         <a class="message-file" href="${escapeHtml(message.attachment_url)}" target="_blank" rel="noopener" download="${escapeHtml(message.attachment_name || "")}">
@@ -1259,11 +1267,25 @@ function subscribeToMessages() {
           renderMessages(currentMessagesCache);
         }
 
-        // Refresh the sidebar preview/unread-count without re-fetching messages.
-        await loadChats();
+        // Refresh the sidebar preview/unread-count — don't block message
+        // rendering on this network round trip (was causing a visible lag
+        // spike on every message on slower connections).
+        scheduleLoadChats();
       }
     )
     .subscribe();
+}
+
+// Coalesces bursts of loadChats() calls (e.g. several messages arriving
+// close together) into a single request instead of one per event.
+let loadChatsScheduled = false;
+function scheduleLoadChats() {
+  if (loadChatsScheduled) return;
+  loadChatsScheduled = true;
+  setTimeout(async () => {
+    loadChatsScheduled = false;
+    await loadChats();
+  }, 300);
 }
 
 // ===============================
@@ -1441,6 +1463,29 @@ const RTC_CONFIG = {
 $("voiceCallButton").addEventListener("click", () => startCall("voice"));
 $("videoCallButton").addEventListener("click", () => startCall("video"));
 
+// Caller-side: watch this specific call's row for status changes so we can
+// stop ringing / auto-close if the callee rejects, or the call times out.
+function subscribeToCallStatus(callId) {
+  return sb
+    .channel(`call-status-${callId}`)
+    .on(
+      "postgres_changes",
+      { event: "UPDATE", schema: "public", table: "calls", filter: `id=eq.${callId}` },
+      (payload) => {
+        if (payload.new.status === "rejected") {
+          toast("تماس رد شد.");
+          endCall(false);
+        } else if (payload.new.status === "missed") {
+          toast("پاسخ داده نشد.");
+          endCall(false);
+        } else if (payload.new.status === "accepted") {
+          stopRingtone();
+        }
+      }
+    )
+    .subscribe();
+}
+
 async function startCall(callType) {
   if (!currentChatId || !currentOtherUser) return;
   if (currentCallId) {
@@ -1481,9 +1526,20 @@ async function startCall(callType) {
 
   openCallModal(callType);
   startRingtone("outgoing");
-  subscribeToCallSignals(call.id);
   await createPeerConnection();
+  subscribeToCallSignals(call.id);
+  callStatusChannel = subscribeToCallStatus(call.id);
   await createAndSendOffer();
+
+  // If nobody answers within 30s, mark the call missed and stop trying.
+  clearTimeout(ringTimeoutId);
+  ringTimeoutId = setTimeout(async () => {
+    if (currentCallId === call.id) {
+      await sb.from("calls").update({ status: "missed", ended_at: new Date().toISOString() }).eq("id", call.id);
+      toast("پاسخ داده نشد.");
+      endCall(false);
+    }
+  }, 30000);
 }
 
 function openCallModal(callType) {
@@ -1575,27 +1631,52 @@ function subscribeToCallSignals(callId) {
       "postgres_changes",
       { event: "INSERT", schema: "public", table: "call_signals", filter: `call_id=eq.${callId}` },
       async (payload) => {
-        const row = payload.new;
-        if (row.sender_id === currentUser.id) return; // ignore our own signal echo
-
-        if (row.signal_type === "offer") {
-          await pc.setRemoteDescription(new RTCSessionDescription(row.payload));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          await sendSignal("answer", answer);
-        } else if (row.signal_type === "answer") {
-          await pc.setRemoteDescription(new RTCSessionDescription(row.payload));
-          stopRingtone();
-        } else if (row.signal_type === "ice-candidate") {
-          try {
-            await pc.addIceCandidate(new RTCIceCandidate(row.payload));
-          } catch { /* benign if candidate arrives after close */ }
-        } else if (row.signal_type === "hangup") {
-          endCall(false);
-        }
+        await handleIncomingSignal(payload.new);
       }
     )
-    .subscribe();
+    .subscribe(async (status) => {
+      // Critical fix: postgres_changes only streams events from the moment
+      // subscribe() completes — it never replays past inserts. The caller's
+      // offer (and any ICE candidates sent while the callee was still
+      // ringing/deciding) would otherwise be silently missed, so audio/video
+      // never connects. Catch up by fetching any signals already in the
+      // table for this call as soon as the channel is live.
+      if (status === "SUBSCRIBED") {
+        const { data: backlog } = await sb
+          .from("call_signals")
+          .select("*")
+          .eq("call_id", callId)
+          .neq("sender_id", currentUser.id)
+          .order("created_at", { ascending: true });
+
+        for (const row of backlog || []) {
+          await handleIncomingSignal(row);
+        }
+      }
+    });
+}
+
+async function handleIncomingSignal(row) {
+  if (row.sender_id === currentUser.id) return; // ignore our own signal echo
+  if (!pc) return; // peer connection not ready yet — shouldn't happen, but guard
+
+  if (row.signal_type === "offer") {
+    await pc.setRemoteDescription(new RTCSessionDescription(row.payload));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await sendSignal("answer", answer);
+  } else if (row.signal_type === "answer") {
+    if (pc.signalingState === "have-local-offer") {
+      await pc.setRemoteDescription(new RTCSessionDescription(row.payload));
+    }
+    stopRingtone();
+  } else if (row.signal_type === "ice-candidate") {
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(row.payload));
+    } catch { /* benign if candidate arrives after close */ }
+  } else if (row.signal_type === "hangup") {
+    endCall(false);
+  }
 }
 
 // Listen for incoming calls addressed to me, at all times (not just while a chat is open).
@@ -1721,8 +1802,8 @@ $("acceptCallBtn").addEventListener("click", async () => {
   await sb.from("calls").update({ status: "accepted" }).eq("id", call.id);
 
   openCallModal(call.call_type);
-  subscribeToCallSignals(call.id);
   await createPeerConnection();
+  subscribeToCallSignals(call.id);
 });
 
 $("rejectCallBtn").addEventListener("click", async () => {
@@ -1736,6 +1817,7 @@ $("hangUpBtn").addEventListener("click", () => endCall(true));
 
 async function endCall(notifyPeer) {
   stopRingtone();
+  clearTimeout(ringTimeoutId);
   if (notifyPeer && currentCallId) {
     await sendSignal("hangup", {});
     await sb.from("calls").update({ status: "ended", ended_at: new Date().toISOString() }).eq("id", currentCallId);
@@ -1744,6 +1826,11 @@ async function endCall(notifyPeer) {
   if (callSignalsChannel) {
     sb.removeChannel(callSignalsChannel);
     callSignalsChannel = null;
+  }
+
+  if (callStatusChannel) {
+    sb.removeChannel(callStatusChannel);
+    callStatusChannel = null;
   }
 
   if (pc) {
