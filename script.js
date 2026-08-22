@@ -243,6 +243,143 @@ async function ensureProfile() {
 }
 
 // ===============================
+// 5b) Profile settings
+// ===============================
+let pendingAvatarFile = null;
+let avatarRemoved = false;
+
+function openSettingsModal() {
+  if (!myProfile) return;
+  $("settingsDisplayName").value = myProfile.display_name || "";
+  $("settingsStatus").value = myProfile.status || "";
+  $("settingsBio").value = myProfile.bio || "";
+  $("bioCharCount").textContent = (myProfile.bio || "").length;
+  $("settingsNewPassword").value = "";
+  $("settingsConfirmPassword").value = "";
+  $("settingsAvatarPreview").innerHTML = avatarHtml(myProfile);
+  pendingAvatarFile = null;
+  avatarRemoved = false;
+  $("settingsModal").classList.remove("hidden");
+}
+
+function closeSettingsModal() {
+  $("settingsModal").classList.add("hidden");
+}
+
+$("openSettings").addEventListener("click", openSettingsModal);
+$("settingsButton").addEventListener("click", openSettingsModal);
+$("closeSettings").addEventListener("click", closeSettingsModal);
+$("cancelSettings").addEventListener("click", closeSettingsModal);
+
+$("settingsBio").addEventListener("input", () => {
+  $("bioCharCount").textContent = $("settingsBio").value.length;
+});
+
+$("uploadAvatarBtn").addEventListener("click", () => $("avatarInput").click());
+
+$("avatarInput").addEventListener("change", () => {
+  const file = $("avatarInput").files[0];
+  if (!file) return;
+  if (!file.type.startsWith("image/")) {
+    toast("فقط فایل تصویری مجاز است.");
+    return;
+  }
+  pendingAvatarFile = file;
+  avatarRemoved = false;
+  $("settingsAvatarPreview").innerHTML = `<img src="${URL.createObjectURL(file)}" alt="">`;
+});
+
+$("removeAvatarBtn").addEventListener("click", () => {
+  pendingAvatarFile = null;
+  avatarRemoved = true;
+  $("settingsAvatarPreview").innerHTML = initials(
+    $("settingsDisplayName").value || myProfile.username
+  );
+});
+
+async function uploadAvatar(file) {
+  const ext = file.name.includes(".") ? file.name.split(".").pop() : "jpg";
+  const path = `${currentUser.id}/avatar-${Date.now()}.${ext}`;
+
+  const { error } = await sb.storage.from(ATTACHMENTS_BUCKET).upload(path, file, {
+    cacheControl: "3600",
+    upsert: false
+  });
+
+  if (error) throw error;
+
+  const { data } = sb.storage.from(ATTACHMENTS_BUCKET).getPublicUrl(path);
+  return data.publicUrl;
+}
+
+$("saveSettings").addEventListener("click", async () => {
+  const displayName = $("settingsDisplayName").value.trim();
+  const status = $("settingsStatus").value.trim();
+  const bio = $("settingsBio").value.trim();
+  const newPassword = $("settingsNewPassword").value;
+  const confirmPassword = $("settingsConfirmPassword").value;
+
+  if (!displayName) {
+    toast("نام نمایشی نمی‌تواند خالی باشد.");
+    return;
+  }
+
+  if (newPassword || confirmPassword) {
+    if (newPassword.length < 6) {
+      toast("رمز عبور جدید باید حداقل ۶ کاراکتر باشد.");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      toast("رمز عبور جدید و تکرار آن یکسان نیستند.");
+      return;
+    }
+  }
+
+  const saveBtn = $("saveSettings");
+  saveBtn.disabled = true;
+
+  try {
+    const updates = {
+      display_name: displayName,
+      status: status || null,
+      bio: bio || null
+    };
+
+    if (pendingAvatarFile) {
+      updates.avatar_url = await uploadAvatar(pendingAvatarFile);
+    } else if (avatarRemoved) {
+      updates.avatar_url = null;
+    }
+
+    const { data: updated, error } = await sb
+      .from("profiles")
+      .update(updates)
+      .eq("id", currentUser.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    if (newPassword) {
+      const { error: passError } = await sb.auth.updateUser({ password: newPassword });
+      if (passError) throw passError;
+    }
+
+    myProfile = updated;
+    $("myUsername").textContent = "@" + myProfile.username;
+    $("myDisplayName").textContent = myProfile.display_name || myProfile.username;
+    $("myAvatar").innerHTML = avatarHtml(myProfile);
+
+    toast("تغییرات ذخیره شد.");
+    closeSettingsModal();
+  } catch (error) {
+    toast(error.message || "ذخیره تغییرات ناموفق بود.");
+  } finally {
+    saveBtn.disabled = false;
+  }
+});
+
+// ===============================
 // 6) Search users
 // ===============================
 let searchTimer;
@@ -298,10 +435,10 @@ async function searchUsers() {
 // 7) Chats
 // ===============================
 async function loadChats() {
-  const { data: memberships, error } = await sb
-    .from("chat_members")
-    .select("chat_id")
-    .eq("user_id", currentUser.id);
+  // Single RPC call replaces what used to be 1 + N*2 separate queries.
+  // See get_chat_list() in fix_n1_query.sql — it does the join,
+  // last-message, and unread-count work in one query on the server.
+  const { data, error } = await sb.rpc("get_chat_list");
 
   if (error) {
     toast(error.message);
@@ -310,56 +447,29 @@ async function loadChats() {
 
   const chatList = $("chatList");
 
-  if (!memberships.length) {
+  if (!data || !data.length) {
     chatList.innerHTML = `<div class="empty-state" style="padding:25px">هنوز گفتگویی نداری.</div>`;
     chatsCache = [];
     return;
   }
 
-  const chatIds = memberships.map(x => x.chat_id);
-
-  const { data: members, error: memberError } = await sb
-    .from("chat_members")
-    .select("chat_id, user_id, profiles(id, username, display_name, avatar_url)")
-    .in("chat_id", chatIds)
-    .neq("user_id", currentUser.id);
-
-  if (memberError) {
-    toast(memberError.message);
-    return;
-  }
-
-  // Last message + unread count per chat, in parallel.
-  const enriched = await Promise.all(members.map(async (member) => {
-    const { data: lastMsgs } = await sb
-      .from("messages")
-      .select("content, attachment_type, created_at, sender_id")
-      .eq("chat_id", member.chat_id)
-      .order("created_at", { ascending: false })
-      .limit(1);
-
-    const { count } = await sb
-      .from("messages")
-      .select("id", { count: "exact", head: true })
-      .eq("chat_id", member.chat_id)
-      .is("read_at", null)
-      .neq("sender_id", currentUser.id);
-
-    return {
-      chatId: member.chat_id,
-      profile: member.profiles,
-      lastMessage: lastMsgs && lastMsgs[0] ? lastMsgs[0] : null,
-      unreadCount: count || 0
-    };
+  chatsCache = data.map(row => ({
+    chatId: row.chat_id,
+    profile: {
+      id: row.other_user_id,
+      username: row.other_username,
+      display_name: row.other_display_name,
+      avatar_url: row.other_avatar_url
+    },
+    lastMessage: row.last_created_at ? {
+      content: row.last_content,
+      attachment_type: row.last_attachment_type,
+      created_at: row.last_created_at,
+      sender_id: row.last_sender_id
+    } : null,
+    unreadCount: row.unread_count || 0
   }));
 
-  enriched.sort((a, b) => {
-    const ta = a.lastMessage ? new Date(a.lastMessage.created_at).getTime() : 0;
-    const tb = b.lastMessage ? new Date(b.lastMessage.created_at).getTime() : 0;
-    return tb - ta;
-  });
-
-  chatsCache = enriched;
   renderChatList();
 }
 
