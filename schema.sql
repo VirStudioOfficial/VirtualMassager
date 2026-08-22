@@ -35,7 +35,7 @@ create table if not exists public.messages (
   sender_id uuid not null references auth.users(id) on delete cascade,
   content text,
   attachment_url text,
-  attachment_type text check (attachment_type in ('image', 'file')),
+  attachment_type text check (attachment_type in ('image', 'file', 'video', 'location', 'contact')),
   attachment_name text,
   created_at timestamptz not null default now(),
   edited_at timestamptz,
