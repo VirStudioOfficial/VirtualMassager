@@ -3,8 +3,8 @@
 // ===============================
 // فقط این دو مقدار را با اطلاعات Supabase خودت عوض کن.
 // SECRET KEY را هرگز اینجا قرار نده.
-const SUPABASE_URL = "YOUR_SUPABASE_URL";
-const SUPABASE_PUBLISHABLE_KEY = "YOUR_SUPABASE_PUBLISHABLE_KEY";
+const SUPABASE_URL = "https://oysthmbsfxfgdyldkqwd.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_7RGLJX4gs3cVZAEsEGqPIA_S0fkKVuI";
 
 const sb = window.supabase.createClient(
   SUPABASE_URL,
