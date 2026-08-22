@@ -29,11 +29,22 @@ let onlineUsers = new Set();
 let authMode = "login";
 let editingMessageId = null;
 let replyingToMessageId = null;
+let forwardingMessageId = null;
 let pendingAttachment = null; // { file, kind: 'image'|'file' }
 let selectedMessageIds = new Set();
+let selectionMode = false;
+let currentMessagesCache = []; // last loaded messages for the open chat (for reply/forward lookups)
+let sendingLock = false; // prevents double-send on rapid double click / double submit
 let pc = null;
 let localStream = null;
 let remoteStream = null;
+let currentCallId = null;
+let currentCallType = null; // 'voice' | 'video'
+let callSignalsChannel = null;
+let incomingCallsChannel = null;
+let isMuted = false;
+let isCameraOff = false;
+let pendingIncomingCall = null; // { call row, caller profile }
 let chatsCache = [];          // enriched chat list for sidebar
 let typingPingTimer = null;
 let typingStaleTimer = null;
@@ -103,6 +114,13 @@ function formatFileSize(bytes) {
 // ===============================
 // 4) Auth - Username + Password
 // ===============================
+// Supabase Auth internally needs an email for password accounts.
+// We generate a hidden internal email from the username.
+//
+// IMPORTANT:
+// Supabase Dashboard -> Authentication -> Providers -> Email
+// Turn OFF "Confirm email" for this simple private project.
+
 toggleAuth.addEventListener("click", () => {
   authMode = authMode === "login" ? "register" : "login";
   authButton.textContent = authMode === "login" ? "ورود" : "ثبت‌نام";
@@ -166,8 +184,24 @@ authForm.addEventListener("submit", async (e) => {
 });
 
 $("logoutButton").addEventListener("click", async () => {
+  try { await sb.rpc("touch_last_seen"); } catch { /* best-effort */ }
+  if (currentCallId) await endCall(true);
+  cleanupAllChannels();
   await sb.auth.signOut();
 });
+
+// Cleans up every realtime channel and timers — called on logout and
+// before subscribing to a new chat, to avoid duplicate subscriptions
+// and memory leaks (previously channels could pile up across chat switches).
+function cleanupAllChannels() {
+  if (messagesChannel) { sb.removeChannel(messagesChannel); messagesChannel = null; }
+  if (typingChannel) { sb.removeChannel(typingChannel); typingChannel = null; }
+  if (onlineChannel) { sb.removeChannel(onlineChannel); onlineChannel = null; }
+  if (callSignalsChannel) { sb.removeChannel(callSignalsChannel); callSignalsChannel = null; }
+  if (incomingCallsChannel) { sb.removeChannel(incomingCallsChannel); incomingCallsChannel = null; }
+  clearTimeout(typingPingTimer);
+  clearTimeout(typingStaleTimer);
+}
 
 // ===============================
 // 5) Bootstrap
@@ -176,15 +210,25 @@ async function init() {
   const { data } = await sb.auth.getSession();
   await handleSession(data.session);
 
-  sb.auth.onAuthStateChange(async (_event, session) => {
+  sb.auth.onAuthStateChange(async (event, session) => {
+    // TOKEN_REFRESHED / USER_UPDATED fire for the same signed-in user and
+    // don't need a full re-init (was re-subscribing everything on every
+    // token refresh, duplicating realtime work). Only react to real
+    // sign-in/sign-out transitions.
+    if (event === "TOKEN_REFRESHED" && currentUser) return;
     await handleSession(session);
   });
 }
 
 async function handleSession(session) {
   if (!session) {
+    cleanupAllChannels();
     currentUser = null;
     myProfile = null;
+    currentChatId = null;
+    currentOtherUser = null;
+    chatsCache = [];
+    currentMessagesCache = [];
     authView.classList.remove("hidden");
     appView.classList.add("hidden");
     return;
@@ -197,6 +241,7 @@ async function handleSession(session) {
   await ensureProfile();
   await loadChats();
   await startPresence();
+  subscribeToIncomingCalls();
 }
 
 async function ensureProfile() {
@@ -433,6 +478,9 @@ async function searchUsers() {
 // 7) Chats
 // ===============================
 async function loadChats() {
+  // Single RPC call replaces what used to be 1 + N*2 separate queries.
+  // See get_chat_list() in fix_n1_query.sql — it does the join,
+  // last-message, and unread-count work in one query on the server.
   const { data, error } = await sb.rpc("get_chat_list");
 
   if (error) {
@@ -582,8 +630,10 @@ async function openChat(chatId, otherUser) {
   clearAttachment();
 
   $("chatTitle").textContent = otherUser.display_name || otherUser.username;
-  $("chatStatus").textContent = onlineUsers.has(otherUser.id) ? "آنلاین" : "آفلاین";
+  $("chatStatus").textContent = statusTextFor(otherUser);
   $("messageForm").classList.remove("hidden");
+  $("voiceCallButton").classList.remove("hidden");
+  $("videoCallButton").classList.remove("hidden");
 
   const headerAvatar = $("chatHeaderAvatar");
   headerAvatar.innerHTML = avatarHtml(otherUser);
@@ -599,7 +649,6 @@ async function openChat(chatId, otherUser) {
   await loadMessages();
   subscribeToMessages();
   subscribeToTyping();
-  subscribeToCallChannel();
   await markChatAsRead();
 }
 
@@ -611,22 +660,39 @@ $("backButton").addEventListener("click", () => {
 // 8) Messages
 // ===============================
 async function loadMessages() {
+  const chatIdAtCall = currentChatId;
+
   const { data, error } = await sb
     .from("messages")
-    .select("id, sender_id, content, attachment_url, attachment_type, attachment_name, created_at, edited_at, read_at")
+    .select("id, sender_id, content, attachment_url, attachment_type, attachment_name, created_at, edited_at, read_at, reply_to_id, forwarded_from_id")
     .eq("chat_id", currentChatId)
-    .order("created_at", { ascending: true });
+    .order("created_at", { ascending: true })
+    .limit(200);
+
+  // The user may have switched chats while this request was in flight —
+  // discard the stale result instead of overwriting the newer chat's messages.
+  if (currentChatId !== chatIdAtCall) return;
 
   if (error) {
     toast(error.message);
     return;
   }
 
-  renderMessages(data || []);
+  currentMessagesCache = data || [];
+  renderMessages(currentMessagesCache);
+}
+
+function findCachedMessage(id) {
+  return currentMessagesCache.find(m => m.id === id);
 }
 
 function renderMessages(messages) {
   const box = $("messages");
+
+  // Preserve scroll position unless the user is already near the bottom —
+  // avoids yanking them to the bottom when an incremental realtime update
+  // (edit/delete elsewhere in the list) re-renders while they're reading history.
+  const wasNearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
 
   if (!messages.length) {
     box.innerHTML = `<div class="empty-state">اولین پیام رو بفرست 👋</div>`;
@@ -636,23 +702,30 @@ function renderMessages(messages) {
   }
 
   renderTypingIndicator();
-  box.scrollTop = box.scrollHeight;
+  if (wasNearBottom) {
+    box.scrollTop = box.scrollHeight;
+  }
 }
 
 function renderMessage(message) {
   const mine = message.sender_id === currentUser.id;
   const pending = message.id.toString().startsWith("temp-");
+  const selected = selectedMessageIds.has(message.id);
 
-  const actions = (mine && !pending && !message.attachment_url) ? `
-    <div class="message-actions">
-      <button data-edit="${message.id}">ویرایش</button>
-      <button class="delete" data-delete="${message.id}">حذف</button>
-    </div>
-  ` : (mine && !pending ? `
-    <div class="message-actions">
-      <button class="delete" data-delete="${message.id}">حذف</button>
-    </div>
-  ` : "");
+  const actionButtons = [
+    `<button data-reply="${message.id}">پاسخ</button>`,
+    `<button data-forward="${message.id}">فوروارد</button>`
+  ];
+  if (message.content) {
+    actionButtons.push(`<button data-copy="${message.id}">کپی</button>`);
+  }
+  if (mine && !pending) {
+    if (!message.attachment_url) {
+      actionButtons.push(`<button data-edit="${message.id}">ویرایش</button>`);
+    }
+    actionButtons.push(`<button class="delete" data-delete="${message.id}">حذف</button>`);
+  }
+  const actions = pending ? "" : `<div class="message-actions">${actionButtons.join("")}</div>`;
 
   let mediaHtml = "";
   if (message.attachment_url) {
@@ -660,12 +733,34 @@ function renderMessage(message) {
       mediaHtml = `<img class="message-image" src="${escapeHtml(message.attachment_url)}" data-view-image="${escapeHtml(message.attachment_url)}" alt="عکس">`;
     } else {
       mediaHtml = `
-        <a class="message-file" href="${escapeHtml(message.attachment_url)}" target="_blank" rel="noopener">
+        <a class="message-file" href="${escapeHtml(message.attachment_url)}" target="_blank" rel="noopener" download="${escapeHtml(message.attachment_name || "")}">
           <span class="file-icon">📎</span>
           <span class="file-name">${escapeHtml(message.attachment_name || "فایل")}</span>
         </a>
       `;
     }
+  }
+
+  let replyHtml = "";
+  if (message.reply_to_id) {
+    const original = findCachedMessage(message.reply_to_id);
+    if (original) {
+      const originalMine = original.sender_id === currentUser.id;
+      const originalPreview = original.content
+        ? escapeHtml(original.content).slice(0, 80)
+        : (original.attachment_type === "image" ? "📷 عکس" : "📎 فایل");
+      replyHtml = `
+        <div class="reply-quote" data-jump-to="${original.id}">
+          <strong>${originalMine ? "شما" : escapeHtml(currentOtherUser?.display_name || currentOtherUser?.username || "")}</strong>
+          <span>${originalPreview}</span>
+        </div>
+      `;
+    }
+  }
+
+  let forwardHtml = "";
+  if (message.forwarded_from_id) {
+    forwardHtml = `<div class="forwarded-label">فوروارد شده</div>`;
   }
 
   const textHtml = message.content
@@ -676,8 +771,15 @@ function renderMessage(message) {
     ? `<span class="read-tick ${message.read_at ? "read" : ""}">${message.read_at ? "✓✓" : "✓"}</span>`
     : "";
 
+  const checkboxHtml = selectionMode
+    ? `<label class="message-select"><input type="checkbox" data-select-checkbox="${message.id}" ${selected ? "checked" : ""}></label>`
+    : "";
+
   return `
-    <div class="message ${mine ? "mine" : ""} ${pending ? "pending" : ""}" data-message-id="${message.id}">
+    <div class="message ${mine ? "mine" : ""} ${pending ? "pending" : ""} ${selected ? "selected" : ""}" data-message-id="${message.id}">
+      ${checkboxHtml}
+      ${forwardHtml}
+      ${replyHtml}
       ${mediaHtml}
       ${textHtml}
       <div class="message-meta">
@@ -694,7 +796,7 @@ function attachMessageActions() {
   document.querySelectorAll("[data-edit]").forEach(btn => {
     btn.addEventListener("click", async () => {
       editingMessageId = btn.dataset.edit;
-      const message = await getMessage(editingMessageId);
+      const message = findCachedMessage(editingMessageId) || await getMessage(editingMessageId);
       if (!message) return;
       $("editInput").value = message.content || "";
       $("editModal").classList.remove("hidden");
@@ -716,12 +818,197 @@ function attachMessageActions() {
     });
   });
 
+  document.querySelectorAll("[data-reply]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      startReply(btn.dataset.reply);
+    });
+  });
+
+  document.querySelectorAll("[data-copy]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const message = findCachedMessage(btn.dataset.copy);
+      if (!message?.content) return;
+      try {
+        await navigator.clipboard.writeText(message.content);
+        toast("پیام کپی شد.");
+      } catch {
+        toast("کپی ناموفق بود.");
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-forward]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      openForwardPicker(btn.dataset.forward);
+    });
+  });
+
+  document.querySelectorAll("[data-jump-to]").forEach(el => {
+    el.addEventListener("click", () => {
+      const target = document.querySelector(`[data-message-id="${el.dataset.jumpTo}"]`);
+      if (target) {
+        target.scrollIntoView({ behavior: "smooth", block: "center" });
+        target.classList.add("flash-highlight");
+        setTimeout(() => target.classList.remove("flash-highlight"), 900);
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-select-checkbox]").forEach(cb => {
+    cb.addEventListener("change", () => {
+      const id = cb.dataset.selectCheckbox;
+      if (cb.checked) selectedMessageIds.add(id);
+      else selectedMessageIds.delete(id);
+      updateSelectionBar();
+    });
+  });
+
   document.querySelectorAll("[data-view-image]").forEach(img => {
     img.addEventListener("click", () => {
       $("imageViewerImg").src = img.dataset.viewImage;
       $("imageViewer").classList.remove("hidden");
     });
   });
+
+  // Long-press / long-click on a message enters selection mode (mobile-friendly multi-select).
+  document.querySelectorAll(".message").forEach(el => {
+    let pressTimer = null;
+    const start = () => {
+      pressTimer = setTimeout(() => {
+        selectionMode = true;
+        selectedMessageIds.add(el.dataset.messageId);
+        renderMessages(currentMessagesCache);
+      }, 500);
+    };
+    const cancel = () => clearTimeout(pressTimer);
+    el.addEventListener("mousedown", start);
+    el.addEventListener("touchstart", start, { passive: true });
+    ["mouseup", "mouseleave", "touchend", "touchmove"].forEach(evt => el.addEventListener(evt, cancel));
+  });
+}
+
+// ---- Reply ----
+function startReply(messageId) {
+  const message = findCachedMessage(messageId);
+  if (!message) return;
+  replyingToMessageId = messageId;
+
+  const mine = message.sender_id === currentUser.id;
+  const senderName = mine ? "شما" : (currentOtherUser?.display_name || currentOtherUser?.username || "");
+  const preview = message.content
+    ? message.content.slice(0, 100)
+    : (message.attachment_type === "image" ? "📷 عکس" : "📎 فایل");
+
+  $("replyPreviewSender").textContent = senderName;
+  $("replyPreviewText").textContent = preview;
+  $("replyPreviewContainer").classList.remove("hidden");
+  $("messageInput").focus();
+}
+
+$("cancelReplyBtn").addEventListener("click", cancelReply);
+
+function cancelReply() {
+  replyingToMessageId = null;
+  $("replyPreviewContainer").classList.add("hidden");
+}
+
+// ---- Forward ----
+async function openForwardPicker(messageId) {
+  forwardingMessageId = messageId;
+
+  if (!chatsCache.length) {
+    toast("گفتگویی برای فوروارد کردن وجود ندارد.");
+    return;
+  }
+
+  const targetUsername = prompt(
+    "برای فوروارد، نام کاربری مقصد را وارد کن:\n" +
+    chatsCache.map(c => "@" + c.profile.username).join("، ")
+  );
+  if (!targetUsername) {
+    forwardingMessageId = null;
+    return;
+  }
+
+  const cleanUsername = targetUsername.trim().replace(/^@/, "").toLowerCase();
+  const targetChat = chatsCache.find(c => c.profile.username.toLowerCase() === cleanUsername);
+
+  if (!targetChat) {
+    toast("کاربری با این نام در لیست گفتگوهات پیدا نشد.");
+    forwardingMessageId = null;
+    return;
+  }
+
+  await forwardMessage(messageId, targetChat.chatId);
+}
+
+async function forwardMessage(messageId, targetChatId) {
+  const original = findCachedMessage(messageId);
+  if (!original) {
+    toast("پیام اصلی پیدا نشد.");
+    return;
+  }
+
+  const { error } = await sb.from("messages").insert({
+    chat_id: targetChatId,
+    sender_id: currentUser.id,
+    content: original.content,
+    attachment_url: original.attachment_url,
+    attachment_type: original.attachment_type,
+    attachment_name: original.attachment_name,
+    forwarded_from_id: original.id
+  });
+
+  if (error) toast(error.message);
+  else toast("پیام فوروارد شد.");
+
+  forwardingMessageId = null;
+}
+
+// ---- Multi-select ----
+function updateSelectionBar() {
+  const count = selectedMessageIds.size;
+  let bar = $("selectionBar");
+
+  if (count === 0) {
+    selectionMode = false;
+    if (bar) bar.remove();
+    renderMessages(currentMessagesCache);
+    return;
+  }
+
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "selectionBar";
+    bar.className = "selection-bar";
+    $("chatHeader").insertAdjacentElement("afterend", bar);
+  }
+
+  bar.innerHTML = `
+    <span>${count} پیام انتخاب شد</span>
+    <div class="selection-actions">
+      <button id="deleteSelectedBtn" class="ghost-button danger-text">حذف</button>
+      <button id="cancelSelectionBtn" class="ghost-button">لغو</button>
+    </div>
+  `;
+
+  $("deleteSelectedBtn").onclick = async () => {
+    if (!confirm(`${count} پیام حذف شود؟`)) return;
+    const ids = Array.from(selectedMessageIds);
+    const { error } = await sb
+      .from("messages")
+      .delete()
+      .in("id", ids)
+      .eq("sender_id", currentUser.id);
+    if (error) toast(error.message);
+    selectedMessageIds.clear();
+    updateSelectionBar();
+  };
+
+  $("cancelSelectionBtn").onclick = () => {
+    selectedMessageIds.clear();
+    updateSelectionBar();
+  };
 }
 
 $("imageViewer").addEventListener("click", () => {
@@ -738,6 +1025,7 @@ async function getMessage(id) {
   return data;
 }
 
+// ---- Attachment picking ----
 $("attachButton").addEventListener("click", () => $("fileInput").click());
 
 $("fileInput").addEventListener("change", () => {
@@ -793,6 +1081,7 @@ async function uploadAttachment(file) {
   return data.publicUrl;
 }
 
+// ---- Sending (optimistic) ----
 $("messageForm").addEventListener("submit", async (e) => {
   e.preventDefault();
 
@@ -800,18 +1089,24 @@ $("messageForm").addEventListener("submit", async (e) => {
   const content = input.value.trim();
   const attachment = pendingAttachment;
 
-  if (!content && !attachment) return;
+  if (!content && !attachment) return; // prevent empty sends
   if (!currentChatId) return;
+  if (sendingLock) return; // prevent duplicate sends from rapid double-submit
+  sendingLock = true;
+
+  const replyToId = replyingToMessageId;
 
   input.value = "";
   clearAttachment();
   clearTyping();
+  cancelReply();
 
   const tempId = `temp-${Date.now()}-${localSeq++}`;
   const box = $("messages");
   const wasEmpty = box.querySelector(".empty-state");
   if (wasEmpty) box.innerHTML = "";
 
+  // Optimistic render — appears instantly, before network/upload finishes.
   const optimisticMessage = {
     id: tempId,
     sender_id: currentUser.id,
@@ -821,10 +1116,14 @@ $("messageForm").addEventListener("submit", async (e) => {
     attachment_name: attachment ? attachment.file.name : null,
     created_at: new Date().toISOString(),
     edited_at: null,
-    read_at: null
+    read_at: null,
+    reply_to_id: replyToId || null,
+    forwarded_from_id: null
   };
 
+  currentMessagesCache.push(optimisticMessage);
   box.insertAdjacentHTML("beforeend", renderMessage(optimisticMessage));
+  attachMessageActions();
   box.scrollTop = box.scrollHeight;
 
   try {
@@ -846,17 +1145,24 @@ $("messageForm").addEventListener("submit", async (e) => {
         content: content || null,
         attachment_url,
         attachment_type,
-        attachment_name
+        attachment_name,
+        reply_to_id: replyToId || null
       });
 
     if (error) throw error;
 
+    // Realtime subscription will re-render with the real row;
+    // remove the temp bubble to avoid a duplicate.
     const tempEl = box.querySelector(`[data-message-id="${tempId}"]`);
     if (tempEl) tempEl.remove();
+    currentMessagesCache = currentMessagesCache.filter(m => m.id !== tempId);
   } catch (error) {
     toast(error.message || "ارسال پیام ناموفق بود.");
     const tempEl = box.querySelector(`[data-message-id="${tempId}"]`);
     if (tempEl) tempEl.remove();
+    currentMessagesCache = currentMessagesCache.filter(m => m.id !== tempId);
+  } finally {
+    sendingLock = false;
   }
 
   input.focus();
@@ -888,6 +1194,7 @@ $("cancelEdit").addEventListener("click", () => {
   editingMessageId = null;
 });
 
+// ---- Read receipts ----
 async function markChatAsRead() {
   if (!currentChatId) return;
 
@@ -911,7 +1218,10 @@ async function markChatAsRead() {
 function subscribeToMessages() {
   if (messagesChannel) {
     sb.removeChannel(messagesChannel);
+    messagesChannel = null;
   }
+
+  const chatIdAtSubscribe = currentChatId;
 
   messagesChannel = sb
     .channel(`chat-${currentChatId}`)
@@ -924,10 +1234,32 @@ function subscribeToMessages() {
         filter: `chat_id=eq.${currentChatId}`
       },
       async (payload) => {
-        await loadMessages();
-        if (payload.eventType === "INSERT" && payload.new.sender_id !== currentUser.id) {
-          await markChatAsRead();
+        // Guard against a stale event arriving after the user switched chats
+        // (race condition when subscriptions overlap during a fast chat switch).
+        if (currentChatId !== chatIdAtSubscribe) return;
+
+        if (payload.eventType === "INSERT") {
+          const row = payload.new;
+          const alreadyHave = currentMessagesCache.some(m => m.id === row.id);
+          if (!alreadyHave) {
+            currentMessagesCache.push(row);
+            renderMessages(currentMessagesCache);
+          }
+          if (row.sender_id !== currentUser.id) {
+            await markChatAsRead();
+          }
+        } else if (payload.eventType === "UPDATE") {
+          const idx = currentMessagesCache.findIndex(m => m.id === payload.new.id);
+          if (idx !== -1) {
+            currentMessagesCache[idx] = payload.new;
+            renderMessages(currentMessagesCache);
+          }
+        } else if (payload.eventType === "DELETE") {
+          currentMessagesCache = currentMessagesCache.filter(m => m.id !== payload.old.id);
+          renderMessages(currentMessagesCache);
         }
+
+        // Refresh the sidebar preview/unread-count without re-fetching messages.
         await loadChats();
       }
     )
@@ -1017,8 +1349,16 @@ function renderTypingIndicator() {
     box.scrollTop = box.scrollHeight;
     $("chatStatus").textContent = "در حال نوشتن...";
   } else if (currentOtherUser) {
-    $("chatStatus").textContent = onlineUsers.has(currentOtherUser.id) ? "آنلاین" : "آفلاین";
+    $("chatStatus").textContent = statusTextFor(currentOtherUser);
   }
+}
+
+function statusTextFor(profile) {
+  if (onlineUsers.has(profile.id)) return "آنلاین";
+  if (profile.last_seen) {
+    return "آخرین بازدید " + formatListTime(profile.last_seen);
+  }
+  return "آفلاین";
 }
 
 // ===============================
@@ -1057,233 +1397,317 @@ async function startPresence() {
 
 function updateOnlineUI() {
   if (currentOtherUser && !isOtherTyping) {
-    $("chatStatus").textContent =
-      onlineUsers.has(currentOtherUser.id) ? "آنلاین" : "آفلاین";
+    $("chatStatus").textContent = statusTextFor(currentOtherUser);
   }
   renderChatList();
 }
 
-// ===============================
-// 12) WebRTC Call System
-// ===============================
-let callChannel = null;
-let isIncomingCall = false;
-let incomingOffer = null;
-
-const rtcConfig = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" }
-  ]
-};
-
-const callModal = $("callModal");
-const localVideo = $("localVideo");
-const remoteVideo = $("remoteVideo");
-const callStatusText = $("callStatusText");
-const acceptCallBtn = $("acceptCallBtn");
-const rejectCallBtn = $("rejectCallBtn");
-const endCallBtn = $("endCallBtn");
-
-function subscribeToCallChannel() {
-  if (callChannel) sb.removeChannel(callChannel);
-
-  callChannel = sb.channel(`call-${currentChatId}`, {
-    config: { broadcast: { self: false } }
-  });
-
-  callChannel
-    .on("broadcast", { event: "call-offer" }, ({ payload }) => handleCallOffer(payload))
-    .on("broadcast", { event: "call-answer" }, ({ payload }) => handleCallAnswer(payload))
-    .on("broadcast", { event: "ice-candidate" }, ({ payload }) => handleIceCandidate(payload))
-    .on("broadcast", { event: "call-rejected" }, () => handleCallRejected())
-    .on("broadcast", { event: "call-ended" }, () => resetCallState("تماس پایان یافت."))
-    .subscribe();
-}
-
-$("startAudioCallBtn")?.addEventListener("click", () => initiateCall(false));
-$("startVideoCallBtn")?.addEventListener("click", () => initiateCall(true));
-acceptCallBtn.addEventListener("click", acceptCall);
-rejectCallBtn.addEventListener("click", rejectCall);
-endCallBtn.addEventListener("click", hangUpCall);
-
-async function initiateCall(isVideo = true) {
-  if (!currentChatId || !currentOtherUser) return;
-
-  showCallModal(`در حال زنگ زدن به ${currentOtherUser.display_name || currentOtherUser.username}...`);
-  endCallBtn.classList.remove("hidden");
-
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      video: isVideo,
-      audio: true
-    });
-    localVideo.srcObject = localStream;
-
-    createPeerConnection();
-
-    localStream.getTracks().forEach(track => {
-      pc.addTrack(track, localStream);
-    });
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    callChannel.send({
-      type: "broadcast",
-      event: "call-offer",
-      payload: {
-        offer,
-        isVideo,
-        callerProfile: myProfile
-      }
-    });
-  } catch (err) {
-    toast("دسترسی به دوربین یا میکروفون داده نشد.");
-    resetCallState();
-  }
-}
-
-function handleCallOffer(payload) {
-  incomingOffer = payload.offer;
-  isIncomingCall = true;
-
-  showCallModal(`تماس ورودی از طرف ${payload.callerProfile.display_name || payload.callerProfile.username}`);
-  acceptCallBtn.classList.remove("hidden");
-  rejectCallBtn.classList.remove("hidden");
-  endCallBtn.classList.add("hidden");
-}
-
-async function acceptCall() {
-  acceptCallBtn.classList.add("hidden");
-  rejectCallBtn.classList.add("hidden");
-  endCallBtn.classList.remove("hidden");
-  callStatusText.textContent = "در حال اتصال...";
-
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      video: true,
-      audio: true
-    });
-    localVideo.srcObject = localStream;
-
-    createPeerConnection();
-
-    localStream.getTracks().forEach(track => {
-      pc.addTrack(track, localStream);
-    });
-
-    await pc.setRemoteDescription(new RTCSessionDescription(incomingOffer));
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-
-    callChannel.send({
-      type: "broadcast",
-      event: "call-answer",
-      payload: { answer }
-    });
-  } catch (err) {
-    toast("خطا در برقراری تماس.");
-    resetCallState();
-  }
-}
-
-async function handleCallAnswer(payload) {
-  if (!pc) return;
-  await pc.setRemoteDescription(new RTCSessionDescription(payload.answer));
-  callStatusText.textContent = "تماس برقرار شد";
-}
-
-function createPeerConnection() {
-  pc = new RTCPeerConnection(rtcConfig);
-
-  pc.onicecandidate = (event) => {
-    if (event.candidate) {
-      callChannel.send({
-        type: "broadcast",
-        event: "ice-candidate",
-        payload: { candidate: event.candidate }
-      });
-    }
-  };
-
-  pc.ontrack = (event) => {
-    if (!remoteStream) {
-      remoteStream = new MediaStream();
-      remoteVideo.srcObject = remoteStream;
-    }
-    remoteStream.addTrack(event.track);
-    callStatusText.textContent = "در حال مکالمه";
-  };
-}
-
-function handleIceCandidate(payload) {
-  if (pc && payload.candidate) {
-    pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
-  }
-}
-
-function rejectCall() {
-  callChannel.send({
-    type: "broadcast",
-    event: "call-rejected"
-  });
-  resetCallState("تماس رد شد.");
-}
-
-function handleCallRejected() {
-  toast("تماس توسط کاربر مقابل رد شد.");
-  resetCallState();
-}
-
-function hangUpCall() {
-  callChannel.send({
-    type: "broadcast",
-    event: "call-ended"
-  });
-  resetCallState("تماس قطع شد.");
-}
-
-function showCallModal(status) {
-  callStatusText.textContent = status;
-  acceptCallBtn.classList.add("hidden");
-  rejectCallBtn.classList.add("hidden");
-  endCallBtn.classList.add("hidden");
-  callModal.classList.remove("hidden");
-}
-
-function resetCallState(toastMsg = null) {
-  if (toastMsg) toast(toastMsg);
-
-  if (pc) {
-    pc.close();
-    pc = null;
-  }
-
-  if (localStream) {
-    localStream.getTracks().forEach(t => t.stop());
-    localStream = null;
-  }
-
-  if (remoteStream) {
-    remoteStream.getTracks().forEach(t => t.stop());
-    remoteStream = null;
-  }
-
-  localVideo.srcObject = null;
-  remoteVideo.srcObject = null;
-  incomingOffer = null;
-  isIncomingCall = false;
-
-  callModal.classList.add("hidden");
-}
-
+// Clean up typing status and record last_seen when leaving the page.
 window.addEventListener("beforeunload", () => {
   if (currentChatId && currentUser) {
     navigator.sendBeacon?.(
       `${SUPABASE_URL}/rest/v1/typing_status?chat_id=eq.${currentChatId}&user_id=eq.${currentUser.id}`
     );
   }
+  if (currentUser) {
+    navigator.sendBeacon?.(
+      `${SUPABASE_URL}/rest/v1/profiles?id=eq.${currentUser.id}`,
+      new Blob([JSON.stringify({ last_seen: new Date().toISOString() })], { type: "application/json" })
+    );
+  }
+});
+
+// ===============================
+// 12) Voice / Video calls (WebRTC + Supabase Realtime signaling)
+// ===============================
+// Architecture:
+// - `calls` row = one call session (ringing/accepted/rejected/ended/missed).
+// - `call_signals` rows = SDP offer/answer + ICE candidates, relayed
+//   through Supabase Realtime (Postgres changes). Actual audio/video never
+//   touches Supabase — it's peer-to-peer via WebRTC once connected.
+// - A public STUN server handles NAT traversal for most home/office networks.
+//   For networks behind strict NATs/firewalls a TURN server would be needed;
+//   swap RTC_CONFIG below to add one when available.
+// - Designed for 1:1 calls today; a future group call can reuse `calls` as
+//   the "room" and add a call_participants table (one row per participant)
+//   without touching this signaling flow.
+
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" }
+  ]
+};
+
+$("voiceCallButton").addEventListener("click", () => startCall("voice"));
+$("videoCallButton").addEventListener("click", () => startCall("video"));
+
+async function startCall(callType) {
+  if (!currentChatId || !currentOtherUser) return;
+  if (currentCallId) {
+    toast("در حال حاضر یک تماس فعال داری.");
+    return;
+  }
+
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: callType === "video"
+    });
+  } catch (err) {
+    toast("دسترسی به میکروفون/دوربین داده نشد.");
+    return;
+  }
+
+  const { data: call, error } = await sb
+    .from("calls")
+    .insert({
+      chat_id: currentChatId,
+      caller_id: currentUser.id,
+      callee_id: currentOtherUser.id,
+      call_type: callType,
+      status: "ringing"
+    })
+    .select()
+    .single();
+
+  if (error) {
+    toast(error.message || "شروع تماس ناموفق بود.");
+    stopLocalStream();
+    return;
+  }
+
+  currentCallId = call.id;
+  currentCallType = callType;
+
+  openCallModal(callType);
+  subscribeToCallSignals(call.id);
+  await createPeerConnection();
+  await createAndSendOffer();
+}
+
+function openCallModal(callType) {
+  $("callTitle").textContent = callType === "video" ? "تماس تصویری" : "تماس صوتی";
+  $("localVideo").classList.toggle("hidden", callType !== "video");
+  $("remoteVideo").classList.toggle("hidden", false);
+  $("toggleCamBtn").classList.toggle("hidden", callType !== "video");
+  $("callModal").classList.remove("hidden");
+
+  if (localStream) {
+    $("localVideo").srcObject = localStream;
+  }
+}
+
+function closeCallModal() {
+  $("callModal").classList.add("hidden");
+  $("localVideo").srcObject = null;
+  $("remoteVideo").srcObject = null;
+}
+
+async function createPeerConnection() {
+  pc = new RTCPeerConnection(RTC_CONFIG);
+
+  localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+  remoteStream = new MediaStream();
+  $("remoteVideo").srcObject = remoteStream;
+
+  pc.ontrack = (event) => {
+    event.streams[0].getTracks().forEach(track => remoteStream.addTrack(track));
+  };
+
+  pc.onicecandidate = async (event) => {
+    if (event.candidate && currentCallId) {
+      await sendSignal("ice-candidate", event.candidate.toJSON());
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc && (pc.connectionState === "failed" || pc.connectionState === "closed")) {
+      endCall(false);
+    }
+  };
+}
+
+async function createAndSendOffer() {
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await sendSignal("offer", offer);
+}
+
+async function sendSignal(signalType, payload) {
+  if (!currentCallId) return;
+  await sb.from("call_signals").insert({
+    call_id: currentCallId,
+    sender_id: currentUser.id,
+    signal_type: signalType,
+    payload
+  });
+}
+
+function subscribeToCallSignals(callId) {
+  if (callSignalsChannel) {
+    sb.removeChannel(callSignalsChannel);
+    callSignalsChannel = null;
+  }
+
+  callSignalsChannel = sb
+    .channel(`call-signals-${callId}`)
+    .on(
+      "postgres_changes",
+      { event: "INSERT", schema: "public", table: "call_signals", filter: `call_id=eq.${callId}` },
+      async (payload) => {
+        const row = payload.new;
+        if (row.sender_id === currentUser.id) return; // ignore our own signal echo
+
+        if (row.signal_type === "offer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(row.payload));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          await sendSignal("answer", answer);
+        } else if (row.signal_type === "answer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(row.payload));
+        } else if (row.signal_type === "ice-candidate") {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(row.payload));
+          } catch { /* benign if candidate arrives after close */ }
+        } else if (row.signal_type === "hangup") {
+          endCall(false);
+        }
+      }
+    )
+    .subscribe();
+}
+
+// Listen for incoming calls addressed to me, at all times (not just while a chat is open).
+function subscribeToIncomingCalls() {
+  if (incomingCallsChannel) {
+    sb.removeChannel(incomingCallsChannel);
+    incomingCallsChannel = null;
+  }
+
+  incomingCallsChannel = sb
+    .channel(`incoming-calls-${currentUser.id}`)
+    .on(
+      "postgres_changes",
+      { event: "INSERT", schema: "public", table: "calls", filter: `callee_id=eq.${currentUser.id}` },
+      async (payload) => {
+        if (currentCallId) {
+          // Already on a call — auto-decline as busy.
+          await sb.from("calls").update({ status: "missed", ended_at: new Date().toISOString() }).eq("id", payload.new.id);
+          return;
+        }
+        await showIncomingCall(payload.new);
+      }
+    )
+    .on(
+      "postgres_changes",
+      { event: "UPDATE", schema: "public", table: "calls", filter: `callee_id=eq.${currentUser.id}` },
+      (payload) => {
+        // Caller may have cancelled before we answered.
+        if (payload.new.status === "ended" && pendingIncomingCall?.call.id === payload.new.id) {
+          dismissIncomingCall();
+        }
+      }
+    )
+    .subscribe();
+}
+
+async function showIncomingCall(call) {
+  const caller = await getProfile(call.caller_id);
+  pendingIncomingCall = { call, caller };
+
+  $("incomingCallAvatar").innerHTML = avatarHtml(caller);
+  $("incomingCallTitle").textContent = caller?.display_name || caller?.username || "کاربر";
+  $("incomingCallSubtitle").textContent = call.call_type === "video" ? "تماس تصویری ورودی" : "تماس صوتی ورودی";
+  $("incomingCallModal").classList.remove("hidden");
+}
+
+function dismissIncomingCall() {
+  pendingIncomingCall = null;
+  $("incomingCallModal").classList.add("hidden");
+}
+
+$("acceptCallBtn").addEventListener("click", async () => {
+  if (!pendingIncomingCall) return;
+  const { call, caller } = pendingIncomingCall;
+  dismissIncomingCall();
+
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: call.call_type === "video"
+    });
+  } catch {
+    toast("دسترسی به میکروفون/دوربین داده نشد.");
+    await sb.from("calls").update({ status: "rejected", ended_at: new Date().toISOString() }).eq("id", call.id);
+    return;
+  }
+
+  currentCallId = call.id;
+  currentCallType = call.call_type;
+  currentOtherUser = currentOtherUser || caller;
+
+  await sb.from("calls").update({ status: "accepted" }).eq("id", call.id);
+
+  openCallModal(call.call_type);
+  subscribeToCallSignals(call.id);
+  await createPeerConnection();
+});
+
+$("rejectCallBtn").addEventListener("click", async () => {
+  if (!pendingIncomingCall) return;
+  const { call } = pendingIncomingCall;
+  dismissIncomingCall();
+  await sb.from("calls").update({ status: "rejected", ended_at: new Date().toISOString() }).eq("id", call.id);
+});
+
+$("hangUpBtn").addEventListener("click", () => endCall(true));
+
+async function endCall(notifyPeer) {
+  if (notifyPeer && currentCallId) {
+    await sendSignal("hangup", {});
+    await sb.from("calls").update({ status: "ended", ended_at: new Date().toISOString() }).eq("id", currentCallId);
+  }
+
+  if (callSignalsChannel) {
+    sb.removeChannel(callSignalsChannel);
+    callSignalsChannel = null;
+  }
+
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+
+  stopLocalStream();
+  remoteStream = null;
+  currentCallId = null;
+  currentCallType = null;
+  isMuted = false;
+  isCameraOff = false;
+
+  closeCallModal();
+}
+
+function stopLocalStream() {
+  if (localStream) {
+    localStream.getTracks().forEach(track => track.stop());
+    localStream = null;
+  }
+}
+
+$("toggleMuteBtn").addEventListener("click", () => {
+  if (!localStream) return;
+  isMuted = !isMuted;
+  localStream.getAudioTracks().forEach(track => { track.enabled = !isMuted; });
+  $("toggleMuteBtn").textContent = isMuted ? "🔇" : "🎤";
+});
+
+$("toggleCamBtn").addEventListener("click", () => {
+  if (!localStream) return;
+  isCameraOff = !isCameraOff;
+  localStream.getVideoTracks().forEach(track => { track.enabled = !isCameraOff; });
+  $("toggleCamBtn").textContent = isCameraOff ? "📷" : "كامرا";
 });
 
 // Start.
