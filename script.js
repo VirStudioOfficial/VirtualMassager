@@ -11,6 +11,10 @@ const sb = window.supabase.createClient(
   SUPABASE_PUBLISHABLE_KEY
 );
 
+const ATTACHMENTS_BUCKET = "chat-attachments";
+const TYPING_TIMEOUT_MS = 4000; // how long before a "typing" row is considered stale
+const TYPING_PING_MS = 2000;    // how often we refresh our own typing row while typing
+
 // ===============================
 // 2) State
 // ===============================
@@ -19,10 +23,17 @@ let myProfile = null;
 let currentChatId = null;
 let currentOtherUser = null;
 let messagesChannel = null;
+let typingChannel = null;
 let onlineChannel = null;
 let onlineUsers = new Set();
 let authMode = "login";
 let editingMessageId = null;
+let pendingAttachment = null; // { file, kind: 'image'|'file' }
+let chatsCache = [];          // enriched chat list for sidebar
+let typingPingTimer = null;
+let typingStaleTimer = null;
+let isOtherTyping = false;
+let localSeq = 0;             // for temp ids on optimistic messages
 
 // ===============================
 // 3) DOM
@@ -35,7 +46,6 @@ const authForm = $("authForm");
 const authButton = $("authButton");
 const toggleAuth = $("toggleAuth");
 const authSubtitle = $("authSubtitle");
-const usernameInput = $("username");
 
 function toast(message) {
   const el = $("toast");
@@ -46,7 +56,7 @@ function toast(message) {
 }
 
 function escapeHtml(value = "") {
-  return value.replace(/[&<>"']/g, (char) => ({
+  return String(value).replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
   }[char]));
 }
@@ -58,8 +68,31 @@ function formatTime(date) {
   });
 }
 
+function formatListTime(date) {
+  const d = new Date(date);
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  if (sameDay) {
+    return d.toLocaleTimeString("fa-IR", { hour: "2-digit", minute: "2-digit" });
+  }
+  return d.toLocaleDateString("fa-IR", { month: "short", day: "numeric" });
+}
+
 function initials(name = "?") {
   return escapeHtml(name.trim().slice(0, 1).toUpperCase() || "?");
+}
+
+function avatarHtml(profile, size) {
+  if (profile?.avatar_url) {
+    return `<img src="${escapeHtml(profile.avatar_url)}" alt="">`;
+  }
+  return initials(profile?.display_name || profile?.username || "?");
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 // ===============================
@@ -67,7 +100,6 @@ function initials(name = "?") {
 // ===============================
 // Supabase Auth internally needs an email for password accounts.
 // We generate a hidden internal email from the username.
-// The user never sees or enters an email.
 //
 // IMPORTANT:
 // Supabase Dashboard -> Authentication -> Providers -> Email
@@ -206,6 +238,8 @@ async function ensureProfile() {
   }
 
   $("myUsername").textContent = "@" + myProfile.username;
+  $("myDisplayName").textContent = myProfile.display_name || myProfile.username;
+  $("myAvatar").innerHTML = avatarHtml(myProfile);
 }
 
 // ===============================
@@ -229,7 +263,7 @@ async function searchUsers() {
 
   const { data, error } = await sb
     .from("profiles")
-    .select("id, username, display_name")
+    .select("id, username, display_name, avatar_url")
     .neq("id", currentUser.id)
     .ilike("username", `%${query}%`)
     .limit(10);
@@ -242,7 +276,7 @@ async function searchUsers() {
   box.innerHTML = data.length
     ? data.map(user => `
       <div class="user-result" data-user-id="${user.id}">
-        <div class="avatar">${initials(user.display_name || user.username)}</div>
+        <div class="avatar">${avatarHtml(user)}</div>
         <div>
           <strong>${escapeHtml(user.display_name || user.username)}</strong>
           <small>@${escapeHtml(user.username)}</small>
@@ -252,7 +286,11 @@ async function searchUsers() {
     : `<div class="empty-state">کاربری پیدا نشد</div>`;
 
   box.querySelectorAll(".user-result").forEach(el => {
-    el.addEventListener("click", () => openOrCreateChat(el.dataset.userId));
+    el.addEventListener("click", () => {
+      $("userSearch").value = "";
+      box.innerHTML = "";
+      openOrCreateChat(el.dataset.userId);
+    });
   });
 }
 
@@ -274,6 +312,7 @@ async function loadChats() {
 
   if (!memberships.length) {
     chatList.innerHTML = `<div class="empty-state" style="padding:25px">هنوز گفتگویی نداری.</div>`;
+    chatsCache = [];
     return;
   }
 
@@ -281,7 +320,7 @@ async function loadChats() {
 
   const { data: members, error: memberError } = await sb
     .from("chat_members")
-    .select("chat_id, user_id, profiles(id, username, display_name)")
+    .select("chat_id, user_id, profiles(id, username, display_name, avatar_url)")
     .in("chat_id", chatIds)
     .neq("user_id", currentUser.id);
 
@@ -290,17 +329,75 @@ async function loadChats() {
     return;
   }
 
-  chatList.innerHTML = members.map(member => {
-    const p = member.profiles;
+  // Last message + unread count per chat, in parallel.
+  const enriched = await Promise.all(members.map(async (member) => {
+    const { data: lastMsgs } = await sb
+      .from("messages")
+      .select("content, attachment_type, created_at, sender_id")
+      .eq("chat_id", member.chat_id)
+      .order("created_at", { ascending: false })
+      .limit(1);
+
+    const { count } = await sb
+      .from("messages")
+      .select("id", { count: "exact", head: true })
+      .eq("chat_id", member.chat_id)
+      .is("read_at", null)
+      .neq("sender_id", currentUser.id);
+
+    return {
+      chatId: member.chat_id,
+      profile: member.profiles,
+      lastMessage: lastMsgs && lastMsgs[0] ? lastMsgs[0] : null,
+      unreadCount: count || 0
+    };
+  }));
+
+  enriched.sort((a, b) => {
+    const ta = a.lastMessage ? new Date(a.lastMessage.created_at).getTime() : 0;
+    const tb = b.lastMessage ? new Date(b.lastMessage.created_at).getTime() : 0;
+    return tb - ta;
+  });
+
+  chatsCache = enriched;
+  renderChatList();
+}
+
+function renderChatList() {
+  const chatList = $("chatList");
+
+  chatList.innerHTML = chatsCache.map(item => {
+    const p = item.profile;
+    const lm = item.lastMessage;
+    let previewText = "شروع گفتگو کن 👋";
+
+    if (lm) {
+      if (lm.content) {
+        previewText = (lm.sender_id === currentUser.id ? "شما: " : "") + lm.content;
+      } else if (lm.attachment_type === "image") {
+        previewText = (lm.sender_id === currentUser.id ? "شما: " : "") + "📷 عکس";
+      } else if (lm.attachment_type === "file") {
+        previewText = (lm.sender_id === currentUser.id ? "شما: " : "") + "📎 فایل";
+      }
+    }
+
+    const isTypingHere = isOtherTyping && currentChatId === item.chatId;
+
     return `
-      <div class="chat-item" data-chat-id="${member.chat_id}" data-user-id="${p.id}">
-        <div class="avatar">${initials(p.display_name || p.username)}</div>
+      <div class="chat-item ${currentChatId === item.chatId ? "active" : ""}" data-chat-id="${item.chatId}" data-user-id="${p.id}">
+        <div class="avatar">
+          ${avatarHtml(p)}
+          ${onlineUsers.has(p.id) ? '<span class="online-dot"></span>' : ''}
+        </div>
         <div class="info">
-          <div class="name">
-            ${escapeHtml(p.display_name || p.username)}
-            ${onlineUsers.has(p.id) ? '<span class="online-dot"></span>' : ''}
+          <div class="name-row">
+            <div class="name"><span class="truncate">${escapeHtml(p.display_name || p.username)}</span></div>
+            <span class="time">${lm ? formatListTime(lm.created_at) : ""}</span>
           </div>
-          <div class="preview">@${escapeHtml(p.username)}</div>
+          <div class="preview-row">
+            <div class="preview ${isTypingHere ? "typing" : ""}">${isTypingHere ? "در حال نوشتن..." : escapeHtml(previewText)}</div>
+            ${item.unreadCount > 0 ? `<span class="unread-badge">${item.unreadCount > 99 ? "99+" : item.unreadCount}</span>` : ""}
+          </div>
         </div>
       </div>
     `;
@@ -308,8 +405,8 @@ async function loadChats() {
 
   chatList.querySelectorAll(".chat-item").forEach(el => {
     el.addEventListener("click", async () => {
-      const profile = await getProfile(el.dataset.userId);
-      openChat(el.dataset.chatId, profile);
+      const item = chatsCache.find(c => c.chatId === el.dataset.chatId);
+      openChat(el.dataset.chatId, item ? item.profile : await getProfile(el.dataset.userId));
     });
   });
 }
@@ -324,10 +421,6 @@ async function getProfile(userId) {
 }
 
 async function openOrCreateChat(otherUserId) {
-  $("userSearch").value = "";
-  $("searchResults").innerHTML = "";
-
-  // Look for an existing 1-to-1 chat containing both users.
   const { data: mine, error: mineError } = await sb
     .from("chat_members")
     .select("chat_id")
@@ -380,10 +473,19 @@ async function openOrCreateChat(otherUserId) {
 async function openChat(chatId, otherUser) {
   currentChatId = chatId;
   currentOtherUser = otherUser;
+  isOtherTyping = false;
+  clearAttachment();
 
   $("chatTitle").textContent = otherUser.display_name || otherUser.username;
   $("chatStatus").textContent = onlineUsers.has(otherUser.id) ? "آنلاین" : "آفلاین";
   $("messageForm").classList.remove("hidden");
+
+  const headerAvatar = $("chatHeaderAvatar");
+  headerAvatar.innerHTML = avatarHtml(otherUser);
+  headerAvatar.classList.remove("hidden");
+
+  document.querySelector(".sidebar").classList.add("chat-open");
+  $("backButton").classList.remove("hidden");
 
   document.querySelectorAll(".chat-item").forEach(el => {
     el.classList.toggle("active", el.dataset.chatId === chatId);
@@ -391,7 +493,13 @@ async function openChat(chatId, otherUser) {
 
   await loadMessages();
   subscribeToMessages();
+  subscribeToTyping();
+  await markChatAsRead();
 }
+
+$("backButton").addEventListener("click", () => {
+  document.querySelector(".sidebar").classList.remove("chat-open");
+});
 
 // ===============================
 // 8) Messages
@@ -399,7 +507,7 @@ async function openChat(chatId, otherUser) {
 async function loadMessages() {
   const { data, error } = await sb
     .from("messages")
-    .select("id, sender_id, content, created_at, edited_at")
+    .select("id, sender_id, content, attachment_url, attachment_type, attachment_name, created_at, edited_at, read_at")
     .eq("chat_id", currentChatId)
     .order("created_at", { ascending: true });
 
@@ -416,29 +524,60 @@ function renderMessages(messages) {
 
   if (!messages.length) {
     box.innerHTML = `<div class="empty-state">اولین پیام رو بفرست 👋</div>`;
-    return;
+  } else {
+    box.innerHTML = messages.map(renderMessage).join("");
+    attachMessageActions();
   }
 
-  box.innerHTML = messages.map(renderMessage).join("");
-  attachMessageActions();
+  renderTypingIndicator();
   box.scrollTop = box.scrollHeight;
 }
 
 function renderMessage(message) {
   const mine = message.sender_id === currentUser.id;
-  const actions = mine ? `
+  const pending = message.id.toString().startsWith("temp-");
+
+  const actions = (mine && !pending && !message.attachment_url) ? `
     <div class="message-actions">
       <button data-edit="${message.id}">ویرایش</button>
       <button class="delete" data-delete="${message.id}">حذف</button>
     </div>
-  ` : "";
+  ` : (mine && !pending ? `
+    <div class="message-actions">
+      <button class="delete" data-delete="${message.id}">حذف</button>
+    </div>
+  ` : "");
+
+  let mediaHtml = "";
+  if (message.attachment_url) {
+    if (message.attachment_type === "image") {
+      mediaHtml = `<img class="message-image" src="${escapeHtml(message.attachment_url)}" data-view-image="${escapeHtml(message.attachment_url)}" alt="عکس">`;
+    } else {
+      mediaHtml = `
+        <a class="message-file" href="${escapeHtml(message.attachment_url)}" target="_blank" rel="noopener">
+          <span class="file-icon">📎</span>
+          <span class="file-name">${escapeHtml(message.attachment_name || "فایل")}</span>
+        </a>
+      `;
+    }
+  }
+
+  const textHtml = message.content
+    ? `<div class="message-text">${escapeHtml(message.content)}</div>`
+    : "";
+
+  const readTick = mine
+    ? `<span class="read-tick ${message.read_at ? "read" : ""}">${message.read_at ? "✓✓" : "✓"}</span>`
+    : "";
 
   return `
-    <div class="message ${mine ? "mine" : ""}" data-message-id="${message.id}">
-      <div class="message-text">${escapeHtml(message.content)}</div>
+    <div class="message ${mine ? "mine" : ""} ${pending ? "pending" : ""}" data-message-id="${message.id}">
+      ${mediaHtml}
+      ${textHtml}
       <div class="message-meta">
-        <span>${formatTime(message.created_at)}</span>
         ${message.edited_at ? "<span>ویرایش‌شده</span>" : ""}
+        <span>${formatTime(message.created_at)}</span>
+        ${readTick}
       </div>
       ${actions}
     </div>
@@ -451,7 +590,7 @@ function attachMessageActions() {
       editingMessageId = btn.dataset.edit;
       const message = await getMessage(editingMessageId);
       if (!message) return;
-      $("editInput").value = message.content;
+      $("editInput").value = message.content || "";
       $("editModal").classList.remove("hidden");
       $("editInput").focus();
     });
@@ -470,7 +609,19 @@ function attachMessageActions() {
       if (error) toast(error.message);
     });
   });
+
+  document.querySelectorAll("[data-view-image]").forEach(img => {
+    img.addEventListener("click", () => {
+      $("imageViewerImg").src = img.dataset.viewImage;
+      $("imageViewer").classList.remove("hidden");
+    });
+  });
 }
+
+$("imageViewer").addEventListener("click", () => {
+  $("imageViewer").classList.add("hidden");
+  $("imageViewerImg").src = "";
+});
 
 async function getMessage(id) {
   const { data } = await sb
@@ -481,28 +632,132 @@ async function getMessage(id) {
   return data;
 }
 
+// ---- Attachment picking ----
+$("attachButton").addEventListener("click", () => $("fileInput").click());
+
+$("fileInput").addEventListener("change", () => {
+  const file = $("fileInput").files[0];
+  if (!file) return;
+
+  if (file.size > 15 * 1024 * 1024) {
+    toast("حجم فایل نباید بیشتر از ۱۵ مگابایت باشد.");
+    $("fileInput").value = "";
+    return;
+  }
+
+  const kind = file.type.startsWith("image/") ? "image" : "file";
+  pendingAttachment = { file, kind };
+
+  const preview = $("attachmentPreview");
+  preview.classList.remove("hidden");
+
+  if (kind === "image") {
+    $("attachmentPreviewImg").src = URL.createObjectURL(file);
+    $("attachmentPreviewImg").classList.remove("hidden");
+    $("attachmentPreviewFile").classList.add("hidden");
+  } else {
+    $("attachmentPreviewImg").classList.add("hidden");
+    $("attachmentPreviewFile").classList.remove("hidden");
+    $("attachmentPreviewName").textContent = `${file.name} · ${formatFileSize(file.size)}`;
+  }
+
+  $("messageInput").focus();
+});
+
+$("removeAttachment").addEventListener("click", clearAttachment);
+
+function clearAttachment() {
+  pendingAttachment = null;
+  $("fileInput").value = "";
+  $("attachmentPreview").classList.add("hidden");
+  $("attachmentPreviewImg").src = "";
+}
+
+async function uploadAttachment(file) {
+  const ext = file.name.includes(".") ? file.name.split(".").pop() : "bin";
+  const path = `${currentUser.id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+
+  const { error } = await sb.storage.from(ATTACHMENTS_BUCKET).upload(path, file, {
+    cacheControl: "3600",
+    upsert: false
+  });
+
+  if (error) throw error;
+
+  const { data } = sb.storage.from(ATTACHMENTS_BUCKET).getPublicUrl(path);
+  return data.publicUrl;
+}
+
+// ---- Sending (optimistic) ----
 $("messageForm").addEventListener("submit", async (e) => {
   e.preventDefault();
 
   const input = $("messageInput");
   const content = input.value.trim();
+  const attachment = pendingAttachment;
 
-  if (!content || !currentChatId) return;
+  if (!content && !attachment) return;
+  if (!currentChatId) return;
 
-  input.disabled = true;
+  input.value = "";
+  clearAttachment();
+  clearTyping();
 
-  const { error } = await sb
-    .from("messages")
-    .insert({
-      chat_id: currentChatId,
-      sender_id: currentUser.id,
-      content
-    });
+  const tempId = `temp-${Date.now()}-${localSeq++}`;
+  const box = $("messages");
+  const wasEmpty = box.querySelector(".empty-state");
+  if (wasEmpty) box.innerHTML = "";
 
-  if (error) toast(error.message);
-  else input.value = "";
+  // Optimistic render — appears instantly, before network/upload finishes.
+  const optimisticMessage = {
+    id: tempId,
+    sender_id: currentUser.id,
+    content: content || null,
+    attachment_url: attachment && attachment.kind === "image" ? URL.createObjectURL(attachment.file) : null,
+    attachment_type: attachment ? attachment.kind : null,
+    attachment_name: attachment ? attachment.file.name : null,
+    created_at: new Date().toISOString(),
+    edited_at: null,
+    read_at: null
+  };
 
-  input.disabled = false;
+  box.insertAdjacentHTML("beforeend", renderMessage(optimisticMessage));
+  box.scrollTop = box.scrollHeight;
+
+  try {
+    let attachment_url = null;
+    let attachment_type = null;
+    let attachment_name = null;
+
+    if (attachment) {
+      attachment_url = await uploadAttachment(attachment.file);
+      attachment_type = attachment.kind;
+      attachment_name = attachment.file.name;
+    }
+
+    const { error } = await sb
+      .from("messages")
+      .insert({
+        chat_id: currentChatId,
+        sender_id: currentUser.id,
+        content: content || null,
+        attachment_url,
+        attachment_type,
+        attachment_name
+      });
+
+    if (error) throw error;
+
+    // Realtime subscription will re-render with the real row;
+    // remove the temp bubble to avoid a duplicate.
+    const tempEl = box.querySelector(`[data-message-id="${tempId}"]`);
+    if (tempEl) tempEl.remove();
+  } catch (error) {
+    toast(error.message || "ارسال پیام ناموفق بود.");
+    const tempEl = box.querySelector(`[data-message-id="${tempId}"]`);
+    if (tempEl) tempEl.remove();
+  }
+
   input.focus();
 });
 
@@ -532,6 +787,24 @@ $("cancelEdit").addEventListener("click", () => {
   editingMessageId = null;
 });
 
+// ---- Read receipts ----
+async function markChatAsRead() {
+  if (!currentChatId) return;
+
+  await sb
+    .from("messages")
+    .update({ read_at: new Date().toISOString() })
+    .eq("chat_id", currentChatId)
+    .is("read_at", null)
+    .neq("sender_id", currentUser.id);
+
+  const item = chatsCache.find(c => c.chatId === currentChatId);
+  if (item) {
+    item.unreadCount = 0;
+    renderChatList();
+  }
+}
+
 // ===============================
 // 9) Realtime messages
 // ===============================
@@ -550,13 +823,106 @@ function subscribeToMessages() {
         table: "messages",
         filter: `chat_id=eq.${currentChatId}`
       },
-      () => loadMessages()
+      async (payload) => {
+        await loadMessages();
+        if (payload.eventType === "INSERT" && payload.new.sender_id !== currentUser.id) {
+          await markChatAsRead();
+        }
+        await loadChats();
+      }
     )
     .subscribe();
 }
 
 // ===============================
-// 10) Online presence
+// 10) Typing indicator
+// ===============================
+$("messageInput").addEventListener("input", () => {
+  if (!currentChatId) return;
+  pingTyping();
+});
+
+async function pingTyping() {
+  clearTimeout(typingPingTimer);
+
+  await sb
+    .from("typing_status")
+    .upsert(
+      { chat_id: currentChatId, user_id: currentUser.id, updated_at: new Date().toISOString() },
+      { onConflict: "chat_id,user_id" }
+    );
+
+  typingPingTimer = setTimeout(clearTyping, TYPING_PING_MS);
+}
+
+async function clearTyping() {
+  clearTimeout(typingPingTimer);
+  if (!currentChatId) return;
+  await sb
+    .from("typing_status")
+    .delete()
+    .eq("chat_id", currentChatId)
+    .eq("user_id", currentUser.id);
+}
+
+function subscribeToTyping() {
+  if (typingChannel) {
+    sb.removeChannel(typingChannel);
+  }
+
+  typingChannel = sb
+    .channel(`typing-${currentChatId}`)
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "typing_status",
+        filter: `chat_id=eq.${currentChatId}`
+      },
+      (payload) => {
+        const row = payload.new && Object.keys(payload.new).length ? payload.new : payload.old;
+        if (!row || row.user_id === currentUser.id) return;
+
+        if (payload.eventType === "DELETE") {
+          setOtherTyping(false);
+          return;
+        }
+
+        setOtherTyping(true);
+
+        clearTimeout(typingStaleTimer);
+        typingStaleTimer = setTimeout(() => setOtherTyping(false), TYPING_TIMEOUT_MS);
+      }
+    )
+    .subscribe();
+}
+
+function setOtherTyping(value) {
+  if (isOtherTyping === value) return;
+  isOtherTyping = value;
+  renderTypingIndicator();
+  renderChatList();
+}
+
+function renderTypingIndicator() {
+  const box = $("messages");
+  const existing = box.querySelector(".typing-indicator");
+  if (existing) existing.remove();
+
+  if (isOtherTyping) {
+    box.insertAdjacentHTML("beforeend", `
+      <div class="typing-indicator"><span></span><span></span><span></span></div>
+    `);
+    box.scrollTop = box.scrollHeight;
+    $("chatStatus").textContent = "در حال نوشتن...";
+  } else if (currentOtherUser) {
+    $("chatStatus").textContent = onlineUsers.has(currentOtherUser.id) ? "آنلاین" : "آفلاین";
+  }
+}
+
+// ===============================
+// 11) Online presence
 // ===============================
 async function startPresence() {
   if (onlineChannel) sb.removeChannel(onlineChannel);
@@ -590,12 +956,21 @@ async function startPresence() {
 }
 
 function updateOnlineUI() {
-  if (currentOtherUser) {
+  if (currentOtherUser && !isOtherTyping) {
     $("chatStatus").textContent =
       onlineUsers.has(currentOtherUser.id) ? "آنلاین" : "آفلاین";
   }
-  loadChats();
+  renderChatList();
 }
+
+// Clean up typing status when leaving the page.
+window.addEventListener("beforeunload", () => {
+  if (currentChatId && currentUser) {
+    navigator.sendBeacon?.(
+      `${SUPABASE_URL}/rest/v1/typing_status?chat_id=eq.${currentChatId}&user_id=eq.${currentUser.id}`
+    );
+  }
+});
 
 // Start.
 init();
