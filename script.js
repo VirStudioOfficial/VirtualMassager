@@ -1480,6 +1480,7 @@ async function startCall(callType) {
   currentCallType = callType;
 
   openCallModal(callType);
+  startRingtone("outgoing");
   subscribeToCallSignals(call.id);
   await createPeerConnection();
   await createAndSendOffer();
@@ -1509,10 +1510,28 @@ async function createPeerConnection() {
   localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
   remoteStream = new MediaStream();
-  $("remoteVideo").srcObject = remoteStream;
+  const remoteVideoEl = $("remoteVideo");
+  remoteVideoEl.srcObject = remoteStream;
 
+  // Use event.track directly instead of event.streams[0] — more reliable
+  // across browsers/tablets, since some don't reliably populate .streams.
   pc.ontrack = (event) => {
-    event.streams[0].getTracks().forEach(track => remoteStream.addTrack(track));
+    if (!remoteStream.getTracks().some(t => t.id === event.track.id)) {
+      remoteStream.addTrack(event.track);
+    }
+    // Mobile browsers (iOS Safari, some Android WebViews) can silently
+    // block autoplay for a stream attached outside a user-gesture handler —
+    // explicitly call play() and retry once if it's blocked.
+    remoteVideoEl.play().catch(() => {
+      toast("برای شنیدن صدا روی صفحه لمس کن.");
+      const resume = () => {
+        remoteVideoEl.play().catch(() => {});
+        document.removeEventListener("touchstart", resume);
+        document.removeEventListener("click", resume);
+      };
+      document.addEventListener("touchstart", resume, { once: true });
+      document.addEventListener("click", resume, { once: true });
+    });
   };
 
   pc.onicecandidate = async (event) => {
@@ -1566,6 +1585,7 @@ function subscribeToCallSignals(callId) {
           await sendSignal("answer", answer);
         } else if (row.signal_type === "answer") {
           await pc.setRemoteDescription(new RTCSessionDescription(row.payload));
+          stopRingtone();
         } else if (row.signal_type === "ice-candidate") {
           try {
             await pc.addIceCandidate(new RTCIceCandidate(row.payload));
@@ -1612,6 +1632,55 @@ function subscribeToIncomingCalls() {
     .subscribe();
 }
 
+// ---- Ringtone (WebAudio-based, no external audio file needed) ----
+let ringAudioCtx = null;
+let ringIntervalId = null;
+
+function startRingtone(pattern = "incoming") {
+  stopRingtone();
+  try {
+    ringAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  } catch {
+    return; // WebAudio unavailable — silently skip, ringtone is non-critical
+  }
+
+  const playBeepPair = () => {
+    if (!ringAudioCtx) return;
+    const now = ringAudioCtx.currentTime;
+    [0, 0.28].forEach((offset) => {
+      const osc = ringAudioCtx.createOscillator();
+      const gain = ringAudioCtx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = pattern === "incoming" ? 880 : 440;
+      gain.gain.setValueAtTime(0.0001, now + offset);
+      gain.gain.exponentialRampToValueAtTime(0.25, now + offset + 0.03);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.25);
+      osc.connect(gain).connect(ringAudioCtx.destination);
+      osc.start(now + offset);
+      osc.stop(now + offset + 0.26);
+    });
+  };
+
+  playBeepPair();
+  ringIntervalId = setInterval(playBeepPair, 1800);
+
+  if (navigator.vibrate && pattern === "incoming") {
+    navigator.vibrate([400, 200, 400, 200, 400]);
+  }
+}
+
+function stopRingtone() {
+  if (ringIntervalId) {
+    clearInterval(ringIntervalId);
+    ringIntervalId = null;
+  }
+  if (ringAudioCtx) {
+    ringAudioCtx.close().catch(() => {});
+    ringAudioCtx = null;
+  }
+  navigator.vibrate?.(0);
+}
+
 async function showIncomingCall(call) {
   const caller = await getProfile(call.caller_id);
   pendingIncomingCall = { call, caller };
@@ -1620,10 +1689,12 @@ async function showIncomingCall(call) {
   $("incomingCallTitle").textContent = caller?.display_name || caller?.username || "کاربر";
   $("incomingCallSubtitle").textContent = call.call_type === "video" ? "تماس تصویری ورودی" : "تماس صوتی ورودی";
   $("incomingCallModal").classList.remove("hidden");
+  startRingtone("incoming");
 }
 
 function dismissIncomingCall() {
   pendingIncomingCall = null;
+  stopRingtone();
   $("incomingCallModal").classList.add("hidden");
 }
 
@@ -1664,6 +1735,7 @@ $("rejectCallBtn").addEventListener("click", async () => {
 $("hangUpBtn").addEventListener("click", () => endCall(true));
 
 async function endCall(notifyPeer) {
+  stopRingtone();
   if (notifyPeer && currentCallId) {
     await sendSignal("hangup", {});
     await sb.from("calls").update({ status: "ended", ended_at: new Date().toISOString() }).eq("id", currentCallId);
