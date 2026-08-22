@@ -15,6 +15,12 @@ const ATTACHMENTS_BUCKET = "chat-attachments";
 const TYPING_TIMEOUT_MS = 4000; // how long before a "typing" row is considered stale
 const TYPING_PING_MS = 2000;    // how often we refresh our own typing row while typing
 
+// ---- Attachment size limits ----
+const MAX_IMAGE_FILE_MB = 15;
+const MAX_VIDEO_FILE_MB = 100;     // raw input cap, before compression
+const VIDEO_COMPRESS_TARGET_MB = 40; // if the (possibly compressed) result is still bigger than this, we keep compressing/lower bitrate
+const VIDEO_COMPRESS_MAX_WIDTH = 1280; // downscale wide videos before re-encoding, faster + smaller
+
 // ===============================
 // 2) State
 // ===============================
@@ -30,7 +36,8 @@ let authMode = "login";
 let editingMessageId = null;
 let replyingToMessageId = null;
 let forwardingMessageId = null;
-let pendingAttachment = null; // { file, kind: 'image'|'file' }
+let pendingAttachment = null; // { file, kind: 'image'|'video'|'file' }
+let videoCompressionInProgress = false;
 let selectedMessageIds = new Set();
 let selectionMode = false;
 let currentMessagesCache = []; // last loaded messages for the open chat (for reply/forward lookups)
@@ -1044,6 +1051,13 @@ function renderMessage(message) {
   if (message.attachment_url) {
     if (message.attachment_type === "image") {
       mediaHtml = `<img class="message-image" src="${escapeHtml(message.attachment_url)}" data-view-image="${escapeHtml(message.attachment_url)}" alt="عکس" loading="lazy" decoding="async">`;
+    } else if (message.attachment_type === "video") {
+      mediaHtml = `
+        <div class="message-video-wrap" data-view-video="${escapeHtml(message.attachment_url)}">
+          <video src="${escapeHtml(message.attachment_url)}" preload="metadata" muted playsinline></video>
+          <div class="message-video-play"><span>▶</span></div>
+        </div>
+      `;
     } else {
       mediaHtml = `
         <a class="message-file" href="${escapeHtml(message.attachment_url)}" target="_blank" rel="noopener" download="${escapeHtml(message.attachment_name || "")}">
@@ -1078,6 +1092,7 @@ function messagePreviewLabel(message) {
   if (message.content) return message.content;
   switch (message.attachment_type) {
     case "image": return "📷 عکس";
+    case "video": return "🎥 ویدیو";
     case "location": return "📍 موقعیت مکانی";
     case "contact": return "👤 مخاطب";
     default: return "📎 فایل";
@@ -1339,7 +1354,20 @@ function attachMessageActions() {
   document.querySelectorAll("[data-view-image]").forEach(img => {
     img.addEventListener("click", () => {
       $("imageViewerImg").src = img.dataset.viewImage;
+      $("imageViewerImg").classList.remove("hidden");
+      $("imageViewerVideo").classList.add("hidden");
+      $("imageViewerVideo").pause();
       $("imageViewer").classList.remove("hidden");
+    });
+  });
+
+  document.querySelectorAll("[data-view-video]").forEach(wrap => {
+    wrap.addEventListener("click", () => {
+      $("imageViewerVideo").src = wrap.dataset.viewVideo;
+      $("imageViewerVideo").classList.remove("hidden");
+      $("imageViewerImg").classList.add("hidden");
+      $("imageViewer").classList.remove("hidden");
+      $("imageViewerVideo").play().catch(() => {});
     });
   });
 
@@ -1491,6 +1519,8 @@ function updateSelectionBar() {
 $("imageViewer").addEventListener("click", () => {
   $("imageViewer").classList.add("hidden");
   $("imageViewerImg").src = "";
+  $("imageViewerVideo").pause();
+  $("imageViewerVideo").src = "";
 });
 
 async function getMessage(id) {
@@ -1505,42 +1535,213 @@ async function getMessage(id) {
 // ---- Attachment picking ----
 $("attachButton").addEventListener("click", () => $("fileInput").click());
 
-$("fileInput").addEventListener("change", () => {
+$("fileInput").addEventListener("change", async () => {
   const file = $("fileInput").files[0];
   if (!file) return;
 
-  if (file.size > 15 * 1024 * 1024) {
-    toast("حجم فایل نباید بیشتر از ۱۵ مگابایت باشد.");
+  const isImage = file.type.startsWith("image/");
+  const isVideo = file.type.startsWith("video/");
+  const kind = isImage ? "image" : (isVideo ? "video" : "file");
+
+  const maxMb = isVideo ? MAX_VIDEO_FILE_MB : MAX_IMAGE_FILE_MB;
+  if (file.size > maxMb * 1024 * 1024) {
+    toast(`حجم فایل نباید بیشتر از ${maxMb} مگابایت باشد.`);
     $("fileInput").value = "";
     return;
   }
 
-  const kind = file.type.startsWith("image/") ? "image" : "file";
+  if (isVideo) {
+    await handleVideoPicked(file);
+    return;
+  }
+
   pendingAttachment = { file, kind };
+  showAttachmentPreview();
+  $("messageInput").focus();
+});
+
+// Shows the attachment preview strip for whatever `pendingAttachment` currently is.
+function showAttachmentPreview() {
+  if (!pendingAttachment) return;
+  const { file, kind } = pendingAttachment;
 
   const preview = $("attachmentPreview");
   preview.classList.remove("hidden");
 
+  $("attachmentPreviewImg").classList.add("hidden");
+  $("attachmentPreviewVideo").classList.add("hidden");
+  $("attachmentPreviewFile").classList.add("hidden");
+  $("attachmentCompressNote").classList.add("hidden");
+
   if (kind === "image") {
     $("attachmentPreviewImg").src = URL.createObjectURL(file);
     $("attachmentPreviewImg").classList.remove("hidden");
-    $("attachmentPreviewFile").classList.add("hidden");
+  } else if (kind === "video") {
+    $("attachmentPreviewVideo").src = URL.createObjectURL(file);
+    $("attachmentPreviewVideo").classList.remove("hidden");
+    $("attachmentCompressNote").textContent = `ویدیو · ${formatFileSize(file.size)}`;
+    $("attachmentCompressNote").classList.remove("hidden");
   } else {
-    $("attachmentPreviewImg").classList.add("hidden");
     $("attachmentPreviewFile").classList.remove("hidden");
     $("attachmentPreviewName").textContent = `${file.name} · ${formatFileSize(file.size)}`;
   }
+}
+
+// Compresses the picked video client-side (re-encode at a lower resolution/
+// bitrate via MediaRecorder) before it becomes the pending attachment, so
+// slow connections upload less data. Falls back to the original file if
+// compression isn't supported or fails — never blocks sending.
+async function handleVideoPicked(file) {
+  const note = $("attachmentCompressNote");
+  const preview = $("attachmentPreview");
+  preview.classList.remove("hidden");
+  $("attachmentPreviewImg").classList.add("hidden");
+  $("attachmentPreviewFile").classList.add("hidden");
+  $("attachmentPreviewVideo").classList.add("hidden");
+  note.classList.remove("hidden");
+  note.textContent = "در حال فشرده‌سازی ویدیو...";
+  videoCompressionInProgress = true;
+
+  let finalFile = file;
+  try {
+    const compressed = await compressVideoFile(file, (pct) => {
+      note.textContent = `در حال فشرده‌سازی ویدیو... ${pct}%`;
+    });
+    if (compressed && compressed.size < file.size) {
+      finalFile = compressed;
+    }
+  } catch (err) {
+    console.warn("Video compression skipped:", err);
+    // Fall back silently to the original file.
+  }
+
+  videoCompressionInProgress = false;
+  pendingAttachment = { file: finalFile, kind: "video" };
+
+  $("attachmentPreviewVideo").src = URL.createObjectURL(finalFile);
+  $("attachmentPreviewVideo").classList.remove("hidden");
+
+  const savedPct = file.size > finalFile.size
+    ? Math.round((1 - finalFile.size / file.size) * 100)
+    : 0;
+  note.textContent = savedPct > 0
+    ? `ویدیو · ${formatFileSize(finalFile.size)} (${savedPct}% کوچک‌تر شد)`
+    : `ویدیو · ${formatFileSize(finalFile.size)}`;
 
   $("messageInput").focus();
-});
+}
+
+// Re-encodes a video using the browser's own decode (via a <video> element)
+// and MediaRecorder + canvas capture pipeline. This re-compresses at a capped
+// resolution/bitrate without any server round-trip. Resolves to a new File,
+// or null if the browser can't do it (caller falls back to the original).
+function compressVideoFile(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    if (typeof MediaRecorder === "undefined" || !window.MediaRecorder) {
+      return reject(new Error("MediaRecorder not supported"));
+    }
+
+    const videoEl = document.createElement("video");
+    videoEl.src = URL.createObjectURL(file);
+    videoEl.muted = true;
+    videoEl.playsInline = true;
+
+    videoEl.addEventListener("error", () => reject(new Error("video decode failed")));
+
+    videoEl.addEventListener("loadedmetadata", () => {
+      const duration = videoEl.duration;
+      if (!isFinite(duration) || duration <= 0) {
+        return reject(new Error("invalid video duration"));
+      }
+
+      const scale = Math.min(1, VIDEO_COMPRESS_MAX_WIDTH / (videoEl.videoWidth || VIDEO_COMPRESS_MAX_WIDTH));
+      const outWidth = Math.round((videoEl.videoWidth || VIDEO_COMPRESS_MAX_WIDTH) * scale / 2) * 2;
+      const outHeight = Math.round((videoEl.videoHeight || 720) * scale / 2) * 2;
+
+      const canvas = document.createElement("canvas");
+      canvas.width = outWidth;
+      canvas.height = outHeight;
+      const ctx = canvas.getContext("2d");
+
+      const canvasStream = canvas.captureStream(30);
+
+      // Preserve audio by routing the source video's audio track into the
+      // recorded stream alongside the re-scaled video frames.
+      let combinedStream = canvasStream;
+      try {
+        if (videoEl.captureStream) {
+          const sourceStream = videoEl.captureStream();
+          const audioTracks = sourceStream.getAudioTracks();
+          if (audioTracks.length) {
+            combinedStream = new MediaStream([...canvasStream.getVideoTracks(), ...audioTracks]);
+          }
+        }
+      } catch { /* audio capture is best-effort; video-only fallback is fine */ }
+
+      const mimeCandidates = [
+        "video/webm;codecs=vp9,opus",
+        "video/webm;codecs=vp8,opus",
+        "video/webm"
+      ];
+      const mimeType = mimeCandidates.find(m => MediaRecorder.isTypeSupported(m)) || "";
+      if (!mimeType) return reject(new Error("no supported recording mime type"));
+
+      // Bitrate scales down for longer videos so total size stays reasonable,
+      // but never below a floor that would make it unwatchable.
+      const targetBitrate = Math.max(700_000, Math.min(2_500_000, (VIDEO_COMPRESS_TARGET_MB * 8_000_000) / Math.max(duration, 1)));
+
+      const recorder = new MediaRecorder(combinedStream, {
+        mimeType,
+        videoBitsPerSecond: Math.round(targetBitrate)
+      });
+
+      const chunks = [];
+      recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+
+      recorder.onstop = () => {
+        URL.revokeObjectURL(videoEl.src);
+        if (!chunks.length) return reject(new Error("no data recorded"));
+        const blob = new Blob(chunks, { type: mimeType });
+        const newName = file.name.replace(/\.[^.]+$/, "") + ".webm";
+        resolve(new File([blob], newName, { type: mimeType }));
+      };
+
+      recorder.onerror = (e) => reject(e.error || new Error("recorder error"));
+
+      let drawing = true;
+      const drawFrame = () => {
+        if (!drawing) return;
+        ctx.drawImage(videoEl, 0, 0, outWidth, outHeight);
+        if (onProgress && duration > 0) {
+          onProgress(Math.min(99, Math.round((videoEl.currentTime / duration) * 100)));
+        }
+        requestAnimationFrame(drawFrame);
+      };
+
+      videoEl.addEventListener("ended", () => {
+        drawing = false;
+        recorder.stop();
+      });
+
+      recorder.start(250);
+      videoEl.play().then(drawFrame).catch((err) => {
+        drawing = false;
+        try { recorder.stop(); } catch {}
+        reject(err);
+      });
+    }, { once: true });
+  });
+}
 
 $("removeAttachment").addEventListener("click", clearAttachment);
 
 function clearAttachment() {
   pendingAttachment = null;
+  videoCompressionInProgress = false;
   $("fileInput").value = "";
   $("attachmentPreview").classList.add("hidden");
   $("attachmentPreviewImg").src = "";
+  $("attachmentPreviewVideo").src = "";
 }
 
 // ---- Self-destruct timer ----
@@ -1703,6 +1904,7 @@ $("messageForm").addEventListener("submit", async (e) => {
   if (!content && !attachment) return; // prevent empty sends
   if (!currentChatId) return;
   if (sendingLock) return; // prevent duplicate sends from rapid double-submit
+  if (videoCompressionInProgress) { toast("صبر کن تا فشرده‌سازی ویدیو تمام بشه."); return; }
   sendingLock = true;
 
   const replyToId = replyingToMessageId;
@@ -1723,7 +1925,7 @@ $("messageForm").addEventListener("submit", async (e) => {
     id: tempId,
     sender_id: currentUser.id,
     content: content || null,
-    attachment_url: attachment && attachment.kind === "image" ? URL.createObjectURL(attachment.file) : null,
+    attachment_url: attachment && (attachment.kind === "image" || attachment.kind === "video") ? URL.createObjectURL(attachment.file) : null,
     attachment_type: attachment ? attachment.kind : null,
     attachment_name: attachment ? attachment.file.name : null,
     created_at: new Date().toISOString(),
