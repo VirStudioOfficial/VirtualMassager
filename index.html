@@ -7,10 +7,73 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <div id="toast"></div>
 
-  <h1>پیام‌رسان من 🚀</h1>
-  <p>پروژه با موفقیت اجرا شد.</p>
+  <section id="authView" class="auth-view">
+    <div class="auth-card">
+      <div class="logo">💬</div>
+      <h1>My Messenger</h1>
+      <p id="authSubtitle">وارد حساب خودت شو</p>
 
+      <form id="authForm">
+        <input id="email" type="email" placeholder="ایمیل" required>
+        <input id="password" type="password" placeholder="رمز عبور" minlength="6" required>
+        <input id="username" class="register-only" type="text" placeholder="نام کاربری" minlength="3" maxlength="30">
+        <button id="authButton" type="submit">ورود</button>
+      </form>
+
+      <button id="toggleAuth" class="link-button">حساب نداری؟ ثبت‌نام کن</button>
+    </div>
+  </section>
+
+  <section id="appView" class="app hidden">
+    <aside class="sidebar">
+      <header class="sidebar-header">
+        <div>
+          <strong>پیام‌ها</strong>
+          <small id="myUsername"></small>
+        </div>
+        <button id="logoutButton" class="icon-button" title="خروج">↪</button>
+      </header>
+
+      <div class="search-box">
+        <input id="userSearch" type="text" placeholder="جستجوی کاربر...">
+      </div>
+      <div id="searchResults" class="search-results"></div>
+      <div id="chatList" class="chat-list"></div>
+    </aside>
+
+    <main class="chat-panel">
+      <header id="chatHeader" class="chat-header">
+        <div>
+          <strong id="chatTitle">یک گفتگو انتخاب کن</strong>
+          <small id="chatStatus"></small>
+        </div>
+      </header>
+
+      <div id="messages" class="messages">
+        <div class="empty-state">از سمت چپ یک گفتگو انتخاب کن 👈</div>
+      </div>
+
+      <form id="messageForm" class="message-form hidden">
+        <input id="messageInput" autocomplete="off" placeholder="پیامت رو بنویس...">
+        <button type="submit">ارسال</button>
+      </form>
+    </main>
+  </section>
+
+  <div id="editModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>ویرایش پیام</h3>
+      <textarea id="editInput"></textarea>
+      <div class="modal-actions">
+        <button id="cancelEdit" type="button">لغو</button>
+        <button id="saveEdit" type="button">ذخیره</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="script.js"></script>
 </body>
 </html>
