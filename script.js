@@ -3,8 +3,8 @@
 // ===============================
 // فقط این دو مقدار را با اطلاعات Supabase خودت عوض کن.
 // SECRET KEY را هرگز اینجا قرار نده.
-const SUPABASE_URL = "https://oysthmbsfxfgdyldkqwd.supabase.co";
-const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_7RGLJX4gs3cVZAEsEGqPIA_S0fkKVuI";
+const SUPABASE_URL = "YOUR_SUPABASE_URL";
+const SUPABASE_PUBLISHABLE_KEY = "YOUR_SUPABASE_PUBLISHABLE_KEY";
 
 const sb = window.supabase.createClient(
   SUPABASE_URL,
@@ -63,36 +63,48 @@ function initials(name = "?") {
 }
 
 // ===============================
-// 4) Auth
+// 4) Auth - Username + Password
 // ===============================
+// Supabase Auth internally needs an email for password accounts.
+// We generate a hidden internal email from the username.
+// The user never sees or enters an email.
+//
+// IMPORTANT:
+// Supabase Dashboard -> Authentication -> Providers -> Email
+// Turn OFF "Confirm email" for this simple private project.
+
 toggleAuth.addEventListener("click", () => {
   authMode = authMode === "login" ? "register" : "login";
-  usernameInput.classList.toggle("register-only", authMode !== "register");
-  usernameInput.required = authMode === "register";
   authButton.textContent = authMode === "login" ? "ورود" : "ثبت‌نام";
   authSubtitle.textContent = authMode === "login"
-    ? "وارد حساب خودت شو"
+    ? "با نام کاربری وارد شو"
     : "حساب جدید بساز";
   toggleAuth.textContent = authMode === "login"
     ? "حساب نداری؟ ثبت‌نام کن"
     : "حساب داری؟ وارد شو";
 });
 
+function internalEmail(username) {
+  return `${username.toLowerCase()}@local.messenger`;
+}
+
 authForm.addEventListener("submit", async (e) => {
   e.preventDefault();
 
-  const email = $("email").value.trim();
+  const username = $("username").value.trim().toLowerCase();
   const password = $("password").value;
-  const username = usernameInput.value.trim();
+
+  if (!/^[a-zA-Z0-9_]{3,30}$/.test(username)) {
+    toast("نام کاربری: ۳ تا ۳۰ کاراکتر، فقط حروف انگلیسی، عدد و _");
+    return;
+  }
 
   authButton.disabled = true;
 
   try {
-    if (authMode === "register") {
-      if (!/^[a-zA-Z0-9_]{3,30}$/.test(username)) {
-        throw new Error("نام کاربری باید ۳ تا ۳۰ کاراکتر و فقط شامل حروف انگلیسی، عدد یا _ باشد.");
-      }
+    const email = internalEmail(username);
 
+    if (authMode === "register") {
       const { data, error } = await sb.auth.signUp({
         email,
         password,
@@ -103,17 +115,21 @@ authForm.addEventListener("submit", async (e) => {
 
       if (error) throw error;
 
-      if (data.user && !data.session) {
-        toast("ثبت‌نام شد. اگر تأیید ایمیل فعال است، ایمیلت را تأیید کن.");
+      if (data.session) {
+        toast("حساب ساخته شد!");
       } else {
-        toast("حساب ساخته شد.");
+        toast("حساب ساخته شد. Confirm Email را در Supabase خاموش کن.");
       }
     } else {
-      const { error } = await sb.auth.signInWithPassword({ email, password });
+      const { error } = await sb.auth.signInWithPassword({
+        email,
+        password
+      });
+
       if (error) throw error;
     }
   } catch (error) {
-    toast(error.message || "خطایی رخ داد.");
+    toast(error.message || "نام کاربری یا رمز عبور اشتباه است.");
   } finally {
     authButton.disabled = false;
   }
