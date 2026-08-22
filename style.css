@@ -883,3 +883,304 @@ html, body {
 @media (min-width: 761px) {
   .back-button { display: none !important; }
 }
+
+/* ===============================
+   Feature additions: reactions, pin, mute, archive
+   =============================== */
+
+.pin-indicator, .mute-indicator {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.chat-item.pinned { background: var(--panel2); }
+
+.unread-badge.muted {
+  background: var(--muted);
+}
+
+.chat-item-menu-btn {
+  opacity: 0;
+  flex-shrink: 0;
+  margin-inline-start: auto;
+  color: var(--muted);
+}
+
+.chat-item:hover .chat-item-menu-btn { opacity: 1; }
+
+.chat-item-menu {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  min-width: 170px;
+  background: var(--panel3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-soft);
+  padding: 6px;
+  z-index: 50;
+}
+
+.chat-item-menu button {
+  text-align: right;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.chat-item-menu button:hover { background: var(--panel2); }
+
+.archived-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.reaction-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.reaction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--panel3);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.reaction-chip.mine {
+  border-color: var(--accent);
+  background: #5b8cff26;
+}
+
+.reaction-chip span { color: var(--muted); font-size: 11px; }
+
+.reaction-picker {
+  position: absolute;
+  display: flex;
+  gap: 6px;
+  background: var(--panel3);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 10px;
+  box-shadow: var(--shadow-soft);
+  z-index: 50;
+}
+
+.reaction-picker button {
+  font-size: 18px;
+  line-height: 1;
+  padding: 2px;
+  transition: transform 0.1s ease;
+}
+
+.reaction-picker button:hover { transform: scale(1.25); }
+
+/* ===============================
+   Light theme
+   =============================== */
+html[data-theme="light"] {
+  --bg: #f4f5f8;
+  --panel: #ffffff;
+  --panel2: #eef0f4;
+  --panel3: #e3e6ec;
+  --border: #dde1e8;
+  --border-soft: #e7eaf0;
+  --text: #171a21;
+  --muted: #6b7280;
+  --accent: #3a6ff0;
+  --accent2: #2c58d1;
+  --mine: #3a6ff0;
+  --mine2: #2c58d1;
+  --danger: #d92d2c;
+  --online: #1fae6e;
+  --shadow-soft: 0 16px 40px #00000022;
+}
+
+html[data-theme="light"] .message:not(.mine) {
+  background: var(--panel2);
+  color: var(--text);
+}
+
+html[data-theme="light"] .message.mine {
+  color: #fff;
+}
+
+/* ===============================
+   Feature additions batch 2: delete chat, delete-for-me, self-destruct,
+   location/contact share, theme switch
+   =============================== */
+
+.chat-item-menu button.danger-text { color: var(--danger); }
+
+.chat-item-menu-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 2px;
+}
+
+.destruct-timer-menu,
+.share-extras-menu {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  min-width: 150px;
+  background: var(--panel3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-soft);
+  padding: 6px;
+  z-index: 50;
+}
+
+.destruct-timer-menu button,
+.share-extras-menu button {
+  text-align: right;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.destruct-timer-menu button:hover,
+.share-extras-menu button:hover { background: var(--panel2); }
+.destruct-timer-menu button.active { color: var(--accent2); font-weight: 600; }
+
+#destructTimerButton.active { color: var(--accent2); }
+
+.message-location, .message-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #0003;
+  margin-bottom: 4px;
+}
+
+.message-contact {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #0003;
+  margin-bottom: 4px;
+}
+
+.message-contact .contact-name { font-weight: 600; }
+.message-contact .contact-phone { color: var(--muted); font-size: 12.5px; direction: ltr; }
+
+.theme-switch {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.theme-switch button {
+  flex: 1;
+  padding: 8px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--panel2);
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.theme-switch button.active {
+  border-color: var(--accent);
+  background: #5b8cff26;
+  color: var(--accent2);
+}
+
+/* ===============================
+   Telegram-style visual polish pass
+   =============================== */
+
+/* Softer, more Telegram-like message tail: sharper corner only on the
+   very first line's edge, rest of the bubble fully rounded. */
+.message {
+  border-bottom-right-radius: 4px;
+  box-shadow: 0 1px 1px #0000000d;
+}
+
+.message.mine {
+  border-bottom-left-radius: 4px;
+  border-bottom-right-radius: var(--radius);
+}
+
+/* Composer: give the icon buttons a touch more breathing room now that
+   there are four of them, and de-emphasize the less-common ones slightly
+   so send/attach stay visually primary. */
+.message-form {
+  gap: 4px;
+}
+
+.message-form .icon-button {
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+}
+
+.message-form input {
+  margin: 0 2px;
+}
+
+/* Chat list: a touch more vertical rhythm and a clearer active/pinned state,
+   closer to Telegram's selected-row treatment. */
+.chat-item {
+  border-radius: 12px;
+  margin: 2px 6px;
+  width: calc(100% - 12px);
+}
+
+.chat-item.active {
+  background: var(--accent);
+}
+
+html[data-theme="light"] .chat-item.active,
+.chat-item.active {
+  color: #fff;
+}
+
+.chat-item.active .preview,
+.chat-item.active .time,
+.chat-item.active small {
+  color: #ffffffb0;
+}
+
+.chat-item.active:hover { background: var(--accent); }
+
+/* Sidebar header: slightly larger avatar area breathing room, subtle divider
+   under the search box like Telegram's chat-list header. */
+.search-box {
+  margin: 6px 10px 4px;
+}
+
+/* Send button: small lift on hover for tactile feedback. */
+.send-button {
+  transition: transform .1s ease, filter .1s ease;
+}
+
+.send-button:hover {
+  transform: scale(1.05);
+  filter: brightness(1.08);
+}
+
+/* Modals: slightly softer corners and entrance motion to match the rest
+   of the app's animation language. */
+.modal-card {
+  animation: pop .18s ease;
+}
