@@ -103,13 +103,6 @@ function formatFileSize(bytes) {
 // ===============================
 // 4) Auth - Username + Password
 // ===============================
-// Supabase Auth internally needs an email for password accounts.
-// We generate a hidden internal email from the username.
-//
-// IMPORTANT:
-// Supabase Dashboard -> Authentication -> Providers -> Email
-// Turn OFF "Confirm email" for this simple private project.
-
 toggleAuth.addEventListener("click", () => {
   authMode = authMode === "login" ? "register" : "login";
   authButton.textContent = authMode === "login" ? "ورود" : "ثبت‌نام";
@@ -440,9 +433,6 @@ async function searchUsers() {
 // 7) Chats
 // ===============================
 async function loadChats() {
-  // Single RPC call replaces what used to be 1 + N*2 separate queries.
-  // See get_chat_list() in fix_n1_query.sql — it does the join,
-  // last-message, and unread-count work in one query on the server.
   const { data, error } = await sb.rpc("get_chat_list");
 
   if (error) {
@@ -609,6 +599,7 @@ async function openChat(chatId, otherUser) {
   await loadMessages();
   subscribeToMessages();
   subscribeToTyping();
+  subscribeToCallChannel();
   await markChatAsRead();
 }
 
@@ -747,7 +738,6 @@ async function getMessage(id) {
   return data;
 }
 
-// ---- Attachment picking ----
 $("attachButton").addEventListener("click", () => $("fileInput").click());
 
 $("fileInput").addEventListener("change", () => {
@@ -803,7 +793,6 @@ async function uploadAttachment(file) {
   return data.publicUrl;
 }
 
-// ---- Sending (optimistic) ----
 $("messageForm").addEventListener("submit", async (e) => {
   e.preventDefault();
 
@@ -823,7 +812,6 @@ $("messageForm").addEventListener("submit", async (e) => {
   const wasEmpty = box.querySelector(".empty-state");
   if (wasEmpty) box.innerHTML = "";
 
-  // Optimistic render — appears instantly, before network/upload finishes.
   const optimisticMessage = {
     id: tempId,
     sender_id: currentUser.id,
@@ -863,8 +851,6 @@ $("messageForm").addEventListener("submit", async (e) => {
 
     if (error) throw error;
 
-    // Realtime subscription will re-render with the real row;
-    // remove the temp bubble to avoid a duplicate.
     const tempEl = box.querySelector(`[data-message-id="${tempId}"]`);
     if (tempEl) tempEl.remove();
   } catch (error) {
@@ -902,7 +888,6 @@ $("cancelEdit").addEventListener("click", () => {
   editingMessageId = null;
 });
 
-// ---- Read receipts ----
 async function markChatAsRead() {
   if (!currentChatId) return;
 
@@ -1078,7 +1063,221 @@ function updateOnlineUI() {
   renderChatList();
 }
 
-// Clean up typing status when leaving the page.
+// ===============================
+// 12) WebRTC Call System
+// ===============================
+let callChannel = null;
+let isIncomingCall = false;
+let incomingOffer = null;
+
+const rtcConfig = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" }
+  ]
+};
+
+const callModal = $("callModal");
+const localVideo = $("localVideo");
+const remoteVideo = $("remoteVideo");
+const callStatusText = $("callStatusText");
+const acceptCallBtn = $("acceptCallBtn");
+const rejectCallBtn = $("rejectCallBtn");
+const endCallBtn = $("endCallBtn");
+
+function subscribeToCallChannel() {
+  if (callChannel) sb.removeChannel(callChannel);
+
+  callChannel = sb.channel(`call-${currentChatId}`, {
+    config: { broadcast: { self: false } }
+  });
+
+  callChannel
+    .on("broadcast", { event: "call-offer" }, ({ payload }) => handleCallOffer(payload))
+    .on("broadcast", { event: "call-answer" }, ({ payload }) => handleCallAnswer(payload))
+    .on("broadcast", { event: "ice-candidate" }, ({ payload }) => handleIceCandidate(payload))
+    .on("broadcast", { event: "call-rejected" }, () => handleCallRejected())
+    .on("broadcast", { event: "call-ended" }, () => resetCallState("تماس پایان یافت."))
+    .subscribe();
+}
+
+$("startAudioCallBtn")?.addEventListener("click", () => initiateCall(false));
+$("startVideoCallBtn")?.addEventListener("click", () => initiateCall(true));
+acceptCallBtn.addEventListener("click", acceptCall);
+rejectCallBtn.addEventListener("click", rejectCall);
+endCallBtn.addEventListener("click", hangUpCall);
+
+async function initiateCall(isVideo = true) {
+  if (!currentChatId || !currentOtherUser) return;
+
+  showCallModal(`در حال زنگ زدن به ${currentOtherUser.display_name || currentOtherUser.username}...`);
+  endCallBtn.classList.remove("hidden");
+
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      video: isVideo,
+      audio: true
+    });
+    localVideo.srcObject = localStream;
+
+    createPeerConnection();
+
+    localStream.getTracks().forEach(track => {
+      pc.addTrack(track, localStream);
+    });
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    callChannel.send({
+      type: "broadcast",
+      event: "call-offer",
+      payload: {
+        offer,
+        isVideo,
+        callerProfile: myProfile
+      }
+    });
+  } catch (err) {
+    toast("دسترسی به دوربین یا میکروفون داده نشد.");
+    resetCallState();
+  }
+}
+
+function handleCallOffer(payload) {
+  incomingOffer = payload.offer;
+  isIncomingCall = true;
+
+  showCallModal(`تماس ورودی از طرف ${payload.callerProfile.display_name || payload.callerProfile.username}`);
+  acceptCallBtn.classList.remove("hidden");
+  rejectCallBtn.classList.remove("hidden");
+  endCallBtn.classList.add("hidden");
+}
+
+async function acceptCall() {
+  acceptCallBtn.classList.add("hidden");
+  rejectCallBtn.classList.add("hidden");
+  endCallBtn.classList.remove("hidden");
+  callStatusText.textContent = "در حال اتصال...";
+
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: true
+    });
+    localVideo.srcObject = localStream;
+
+    createPeerConnection();
+
+    localStream.getTracks().forEach(track => {
+      pc.addTrack(track, localStream);
+    });
+
+    await pc.setRemoteDescription(new RTCSessionDescription(incomingOffer));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    callChannel.send({
+      type: "broadcast",
+      event: "call-answer",
+      payload: { answer }
+    });
+  } catch (err) {
+    toast("خطا در برقراری تماس.");
+    resetCallState();
+  }
+}
+
+async function handleCallAnswer(payload) {
+  if (!pc) return;
+  await pc.setRemoteDescription(new RTCSessionDescription(payload.answer));
+  callStatusText.textContent = "تماس برقرار شد";
+}
+
+function createPeerConnection() {
+  pc = new RTCPeerConnection(rtcConfig);
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      callChannel.send({
+        type: "broadcast",
+        event: "ice-candidate",
+        payload: { candidate: event.candidate }
+      });
+    }
+  };
+
+  pc.ontrack = (event) => {
+    if (!remoteStream) {
+      remoteStream = new MediaStream();
+      remoteVideo.srcObject = remoteStream;
+    }
+    remoteStream.addTrack(event.track);
+    callStatusText.textContent = "در حال مکالمه";
+  };
+}
+
+function handleIceCandidate(payload) {
+  if (pc && payload.candidate) {
+    pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+  }
+}
+
+function rejectCall() {
+  callChannel.send({
+    type: "broadcast",
+    event: "call-rejected"
+  });
+  resetCallState("تماس رد شد.");
+}
+
+function handleCallRejected() {
+  toast("تماس توسط کاربر مقابل رد شد.");
+  resetCallState();
+}
+
+function hangUpCall() {
+  callChannel.send({
+    type: "broadcast",
+    event: "call-ended"
+  });
+  resetCallState("تماس قطع شد.");
+}
+
+function showCallModal(status) {
+  callStatusText.textContent = status;
+  acceptCallBtn.classList.add("hidden");
+  rejectCallBtn.classList.add("hidden");
+  endCallBtn.classList.add("hidden");
+  callModal.classList.remove("hidden");
+}
+
+function resetCallState(toastMsg = null) {
+  if (toastMsg) toast(toastMsg);
+
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+    localStream = null;
+  }
+
+  if (remoteStream) {
+    remoteStream.getTracks().forEach(t => t.stop());
+    remoteStream = null;
+  }
+
+  localVideo.srcObject = null;
+  remoteVideo.srcObject = null;
+  incomingOffer = null;
+  isIncomingCall = false;
+
+  callModal.classList.add("hidden");
+}
+
 window.addEventListener("beforeunload", () => {
   if (currentChatId && currentUser) {
     navigator.sendBeacon?.(
