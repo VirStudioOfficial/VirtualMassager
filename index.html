@@ -63,6 +63,31 @@
         <div class="empty-state">از سمت راست یک گفتگو انتخاب کن 👉</div>
       </div>
 
+      <div id="replyPreviewContainer" class="reply-preview-container hidden">
+        <div class="reply-preview-content">
+          <strong id="replyPreviewSender"></strong>
+          <span id="replyPreviewText"></span>
+        </div>
+        <button id="cancelReplyBtn" class="icon-button" type="button">✕</button>
+      </div>
+
+      <div id="callModal" class="modal hidden">
+        <div class="modal-card call-card">
+          <div class="call-header">
+            <h3 id="callTitle">تماس صوتی / تصویری</h3>
+          </div>
+          <div class="call-videos">
+            <video id="remoteVideo" autoplay playsinline></video>
+            <video id="localVideo" autoplay playsinline muted></video>
+          </div>
+          <div class="call-actions">
+            <button id="toggleMuteBtn" class="icon-button" type="button" title="قطع/وصل صدا">🎤</button>
+            <button id="toggleCamBtn" class="icon-button" type="button" title="قطع/وصل دوربین"> كامرا </button>
+            <button id="hangUpBtn" class="ghost-button danger-text" type="button">قطع تماس</button>
+          </div>
+        </div>
+      </div>
+
       <div id="attachmentPreview" class="attachment-preview hidden">
         <div class="attachment-preview-inner">
           <img id="attachmentPreviewImg" class="hidden" alt="پیش‌نمایش">
