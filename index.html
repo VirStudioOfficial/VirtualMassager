@@ -3,179 +3,182 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>چت روم با Supabase</title>
-  <style>
-    /* استایل‌های پایه و بخش چت */
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: Tahoma, sans-serif; }
-    body { background: #f0f2f5; height: 100vh; display: flex; justify-content: center; align-items: center; }
-    .hidden { display: none !important; }
-    
-    /* فرم ورود */
-    #authView { width: 100%; max-width: 400px; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center; }
-    #authView h2 { margin-bottom: 5px; color: #333; }
-    #authView p { margin-bottom: 20px; color: #666; font-size: 14px; }
-    .form-group { margin-bottom: 15px; text-align: right; }
-    .form-group label { display: block; margin-bottom: 5px; font-size: 13px; color: #444; }
-    .form-control { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; }
-    .btn { width: 100%; padding: 10px; background: #0084ff; color: white; border: none; border-radius: 6px; font-size: 15px; cursor: pointer; }
-    .btn:hover { background: #006dd6; }
-    .toggle-auth { margin-top: 15px; font-size: 13px; color: #0084ff; cursor: pointer; display: inline-block; }
-
-    /* ساختار اصلی برنامه */
-    #appView { width: 100%; height: 100%; max-width: 1200px; background: white; display: flex; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-    
-    /* سایدبار */
-    .sidebar { width: 350px; border-left: 1px solid #ddd; display: flex; flex-direction: column; background: #fff; }
-    .sidebar-header { padding: 15px; border-bottom: 1px solid #ddd; display: flex; align-items: center; justify-content: space-between; }
-    .user-info { display: flex; align-items: center; gap: 10px; }
-    .avatar { width: 40px; height: 40px; border-radius: 50%; background: #ccc; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; position: relative; overflow: hidden; }
-    .avatar img { width: 100%; height: 100%; object-fit: cover; }
-    .online-dot { width: 10px; height: 10px; background: #31a24c; border-radius: 50%; position: absolute; bottom: 2px; right: 2px; border: 2px solid white; }
-    
-    .search-box { padding: 10px 15px; border-bottom: 1px solid #eee; }
-    .search-box input { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 20px; font-size: 13px; background: #f0f2f5; border: none; text-align: center; }
-    
-    .chat-list { flex: 1; overflow-y: auto; }
-    .chat-item { display: flex; align-items: center; gap: 12px; padding: 12px 15px; cursor: pointer; border-bottom: 1px solid #f5f5f5; }
-    .chat-item:hover, .chat-item.active { background: #f0f2f5; }
-    .chat-item .info { flex: 1; min-width: 0; }
-    .chat-item .name-row { display: flex; justify-content: space-between; margin-bottom: 3px; }
-    .chat-item .name { font-weight: bold; font-size: 14px; color: #333; }
-    .chat-item .time { font-size: 11px; color: #888; }
-    .chat-item .preview-row { display: flex; justify-content: space-between; align-items: center; }
-    .chat-item .preview { font-size: 12px; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .chat-item .preview.typing { color: #31a24c; }
-    .unread-badge { background: #0084ff; color: white; border-radius: 10px; padding: 2px 6px; font-size: 10px; }
-
-    /* پنجره چت */
-    .chat-container { flex: 1; display: flex; flex-direction: column; background: #e5ddd5; }
-    .chat-header { padding: 10px 15px; background: white; border-bottom: 1px solid #ddd; display: flex; align-items: center; justify-content: space-between; }
-    .chat-header-user { display: flex; align-items: center; gap: 10px; }
-    .chat-header-actions { display: flex; gap: 10px; }
-    .chat-header-actions button { background: none; border: none; font-size: 18px; cursor: pointer; padding: 5px; border-radius: 50%; }
-    .chat-header-actions button:hover { background: #f0f2f5; }
-
-    .messages-area { flex: 1; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
-    .message { max-width: 65%; padding: 8px 12px; border-radius: 8px; font-size: 14px; position: relative; word-break: break-word; background: white; align-self: flex-start; box-shadow: 0 1px 0.5px rgba(0,0,0,0.13); }
-    .message.mine { background: #d9fdd3; align-self: flex-end; }
-    .message-meta { font-size: 10px; color: #999; display: flex; gap: 5px; justify-content: flex-end; margin-top: 4px; }
-    .read-tick.read { color: #53bdeb; }
-
-    .message-form { padding: 10px 15px; background: #f0f2f5; display: flex; align-items: center; gap: 10px; }
-    .message-form input { flex: 1; padding: 10px; border: none; border-radius: 20px; font-size: 14px; outline: none; }
-
-    /* مودال تماس */
-    .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); display: flex; justify-content: center; align-items: center; z-index: 1000; }
-    .call-container { background: #222; width: 100%; max-width: 700px; border-radius: 12px; padding: 20px; color: white; display: flex; flex-direction: column; align-items: center; }
-    .video-grid { display: flex; gap: 10px; width: 100%; height: 400px; justify-content: center; margin-bottom: 20px; position: relative; background: black; border-radius: 8px; overflow: hidden; }
-    .video-grid video { width: 100%; height: 100%; object-fit: cover; }
-    #localVideo { position: absolute; bottom: 15px; right: 15px; width: 120px; height: 90px; border-radius: 6px; border: 2px solid white; background: #333; }
-    .call-status { margin-bottom: 15px; font-size: 15px; color: #ccc; }
-    .call-actions { display: flex; gap: 15px; }
-    .call-actions button { padding: 10px 20px; border: none; border-radius: 30px; font-size: 14px; cursor: pointer; color: white; }
-    .btn-success { background: #31a24c; }
-    .btn-danger { background: #e41e3f; }
-
-    /* Toast */
-    #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #333; color: white; padding: 10px 20px; border-radius: 6px; font-size: 13px; z-index: 2000; display: none; }
-  </style>
+  <title>Virtual Messenger</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <div id="toast"></div>
 
-  <!-- صفحه ورود / ثبت‌نام -->
-  <div id="authView">
-    <h2>چت روم آنلاین</h2>
-    <p id="authSubtitle">با نام کاربری وارد شو</p>
-    <form id="authForm">
-      <div class="form-group">
-        <label>نام کاربری</label>
-        <input type="text" id="username" class="form-control" required autocomplete="username">
-      </div>
-      <div class="form-group">
-        <label>رمز عبور</label>
-        <input type="password" id="password" class="form-control" required autocomplete="current-password">
-      </div>
-      <button type="submit" id="authButton" class="btn">ورود</button>
-    </form>
-    <span id="toggleAuth" class="toggle-auth">حساب نداری؟ ثبت‌نام کن</span>
-  </div>
+  <section id="authView" class="auth-view">
+    <div class="auth-card">
+      <div class="logo">💬</div>
+      <h1>Virtual Messenger</h1>
+      <p id="authSubtitle">وارد حساب خودت شو</p>
 
-  <!-- برنامه اصلی چت -->
-  <div id="appView" class="hidden">
-    <!-- سایدبار گفتگوها -->
-    <div class="sidebar">
-      <div class="sidebar-header">
-        <div class="user-info">
-          <div id="myAvatar" class="avatar">?</div>
-          <div>
-            <strong id="myDisplayName" style="font-size: 14px; display: block;">کاربر</strong>
-            <small id="myUsername" style="color: #666; font-size: 11px;">@username</small>
-          </div>
-        </div>
-        <button id="logoutButton" style="background: none; border: none; color: #888; cursor: pointer; font-size: 12px;">خروج</button>
-      </div>
-      
-      <div class="search-box">
-        <input type="text" id="userSearch" placeholder="جستجوی کاربر...">
-        <div id="searchResults" style="margin-top: 5px;"></div>
-      </div>
+      <form id="authForm">
+        <input id="username" type="text" placeholder="نام کاربری" minlength="3" maxlength="30" required>
+        <input id="password" type="password" placeholder="رمز عبور" minlength="6" required>
+        <button id="authButton" type="submit">ورود</button>
+      </form>
 
-      <div id="chatList" class="chat-list">
-        <!-- لیست چت‌ها اینجا لود می‌شوند -->
-      </div>
+      <button id="toggleAuth" class="link-button">حساب نداری؟ ثبت‌نام کن</button>
     </div>
+  </section>
 
-    <!-- پنل اصلی چت -->
-    <div class="chat-container">
-      <div class="chat-header">
-        <div class="chat-header-user">
-          <div id="chatHeaderAvatar" class="avatar hidden">?</div>
+  <section id="appView" class="app hidden">
+    <aside class="sidebar">
+      <header class="sidebar-header">
+        <div class="me" id="openSettings" title="تنظیمات پروفایل">
+          <div class="avatar me-avatar" id="myAvatar"></div>
           <div>
-            <div id="chatTitle" style="font-weight: bold; font-size: 15px;">یک گفتگو را انتخاب کنید</div>
-            <div id="chatStatus" style="font-size: 11px; color: #666;"></div>
+            <strong id="myDisplayName"></strong>
+            <small id="myUsername"></small>
           </div>
         </div>
-        
-        <!-- دکمه‌های تماس صوتی و تصویری -->
-        <div class="chat-header-actions">
-          <button id="startAudioCallBtn" title="تماس صوتی">📞</button>
-          <button id="startVideoCallBtn" title="تماس تصویری">📹</button>
+        <div class="header-actions">
+          <button id="settingsButton" class="icon-button" title="تنظیمات">⚙</button>
+          <button id="logoutButton" class="icon-button" title="خروج">↪</button>
+        </div>
+      </header>
+
+      <div class="search-box">
+        <span class="search-icon">🔍</span>
+        <input id="userSearch" type="text" placeholder="جستجوی کاربر...">
+      </div>
+      <div id="searchResults" class="search-results"></div>
+      <div id="chatList" class="chat-list"></div>
+    </aside>
+
+    <main class="chat-panel">
+      <header id="chatHeader" class="chat-header">
+        <button id="backButton" class="icon-button back-button hidden" title="بازگشت">→</button>
+        <div class="avatar chat-header-avatar hidden" id="chatHeaderAvatar"></div>
+        <div class="chat-header-info">
+          <strong id="chatTitle">یک گفتگو انتخاب کن</strong>
+          <small id="chatStatus"></small>
+        </div>
+        <div class="header-actions">
+          <button id="voiceCallButton" class="icon-button hidden" title="تماس صوتی">📞</button>
+          <button id="videoCallButton" class="icon-button hidden" title="تماس تصویری">🎥</button>
+        </div>
+      </header>
+
+      <div id="messages" class="messages">
+        <div class="empty-state">از سمت راست یک گفتگو انتخاب کن 👉</div>
+      </div>
+
+      <div id="replyPreviewContainer" class="reply-preview-container hidden">
+        <div class="reply-preview-content">
+          <strong id="replyPreviewSender"></strong>
+          <span id="replyPreviewText"></span>
+        </div>
+        <button id="cancelReplyBtn" class="icon-button" type="button">✕</button>
+      </div>
+
+      <div id="callModal" class="modal hidden">
+        <div class="modal-card call-card">
+          <div class="call-header">
+            <h3 id="callTitle">تماس صوتی / تصویری</h3>
+          </div>
+          <div class="call-videos">
+            <video id="remoteVideo" autoplay playsinline></video>
+            <video id="localVideo" autoplay playsinline muted></video>
+          </div>
+          <div class="call-actions">
+            <button id="toggleMuteBtn" class="icon-button" type="button" title="قطع/وصل صدا">🎤</button>
+            <button id="toggleCamBtn" class="icon-button" type="button" title="قطع/وصل دوربین"> كامرا </button>
+            <button id="hangUpBtn" class="ghost-button danger-text" type="button">قطع تماس</button>
+          </div>
         </div>
       </div>
 
-      <div id="messages" class="messages-area">
-        <div class="empty-state" style="text-align: center; color: #770000; margin-top: 50px;">یک چت را از لیست انتخاب کنید</div>
+      <div id="attachmentPreview" class="attachment-preview hidden">
+        <div class="attachment-preview-inner">
+          <img id="attachmentPreviewImg" class="hidden" alt="پیش‌نمایش">
+          <div id="attachmentPreviewFile" class="attachment-file-chip hidden">
+            <span>📎</span>
+            <span id="attachmentPreviewName"></span>
+          </div>
+          <button id="removeAttachment" type="button" class="icon-button">✕</button>
+        </div>
       </div>
 
       <form id="messageForm" class="message-form hidden">
-        <input type="text" id="messageInput" placeholder="پیام خود را بنویسید..." autocomplete="off">
-        <button type="submit" class="btn" style="width: auto; padding: 10px 20px;">ارسال</button>
+        <input id="fileInput" type="file" accept="image/*,.pdf,.zip,.rar,.txt,.doc,.docx" hidden>
+        <button id="attachButton" type="button" class="icon-button" title="پیوست فایل">📎</button>
+        <input id="messageInput" autocomplete="off" placeholder="پیامت رو بنویس...">
+        <button id="sendButton" type="submit" class="send-button" title="ارسال">➤</button>
       </form>
+    </main>
+  </section>
+
+  <div id="editModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>ویرایش پیام</h3>
+      <textarea id="editInput"></textarea>
+      <div class="modal-actions">
+        <button id="cancelEdit" type="button">لغو</button>
+        <button id="saveEdit" type="button">ذخیره</button>
+      </div>
     </div>
   </div>
 
-  <!-- مودال تماس صوتی و تصویری -->
-  <div id="callModal" class="modal hidden">
-    <div class="call-container">
-      <div class="video-grid">
-        <video id="remoteVideo" autoplay playsinline></video>
-        <video id="localVideo" autoplay playsinline muted></video>
+  <div id="imageViewer" class="image-viewer hidden">
+    <img id="imageViewerImg" alt="عکس">
+  </div>
+
+  <div id="settingsModal" class="modal hidden">
+    <div class="modal-card settings-card">
+      <div class="settings-header">
+        <h3>تنظیمات پروفایل</h3>
+        <button id="closeSettings" class="icon-button" type="button">✕</button>
       </div>
-      <div id="callStatusText" class="call-status">در حال برقراری تماس...</div>
+
+      <div class="settings-avatar-row">
+        <div class="avatar settings-avatar" id="settingsAvatarPreview"></div>
+        <div class="settings-avatar-actions">
+          <button id="uploadAvatarBtn" type="button" class="ghost-button">تغییر آواتار</button>
+          <button id="removeAvatarBtn" type="button" class="ghost-button danger-text">حذف آواتار</button>
+          <input id="avatarInput" type="file" accept="image/*" hidden>
+        </div>
+      </div>
+
+      <label class="settings-label">نام نمایشی</label>
+      <input id="settingsDisplayName" type="text" maxlength="30" placeholder="نام نمایشی">
+
+      <label class="settings-label">وضعیت</label>
+      <input id="settingsStatus" type="text" maxlength="40" placeholder="مثلاً: سرم شلوغه، بعداً جواب می‌دم">
+
+      <label class="settings-label">بایو</label>
+      <textarea id="settingsBio" maxlength="160" placeholder="چند خط درباره‌ی خودت..."></textarea>
+      <small class="char-count"><span id="bioCharCount">0</span>/۱۶۰</small>
+
+      <div class="settings-divider"></div>
+
+      <label class="settings-label">تغییر رمز عبور</label>
+      <input id="settingsNewPassword" type="password" placeholder="رمز عبور جدید (حداقل ۶ کاراکتر)" minlength="6" autocomplete="new-password">
+      <input id="settingsConfirmPassword" type="password" placeholder="تکرار رمز عبور جدید" minlength="6" autocomplete="new-password">
+
+      <div class="modal-actions">
+        <button id="cancelSettings" type="button">لغو</button>
+        <button id="saveSettings" type="button">ذخیره تغییرات</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="incomingCallModal" class="modal hidden">
+    <div class="modal-card call-card incoming-call-card">
+      <div class="avatar settings-avatar" id="incomingCallAvatar" style="margin:0 auto 14px"></div>
+      <h3 id="incomingCallTitle">تماس ورودی</h3>
+      <p id="incomingCallSubtitle" class="incoming-call-subtitle"></p>
       <div class="call-actions">
-        <button id="acceptCallBtn" class="btn-success hidden">پاسخ</button>
-        <button id="rejectCallBtn" class="btn-danger hidden">رد تماس</button>
-        <button id="endCallBtn" class="btn-danger hidden">قطع تماس</button>
+        <button id="rejectCallBtn" class="ghost-button danger-text">رد تماس</button>
+        <button id="acceptCallBtn" class="send-button" style="width:auto;border-radius:13px;padding:12px 24px;">پاسخ</button>
       </div>
     </div>
   </div>
 
-  <!-- اعلان متنی -->
-  <div id="toast"></div>
-
-  <!-- کتابخانه Supabase -->
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <!-- اسکریپت اصلی جاوااسکریپت -->
-  <script src="app.js"></script>
+  <script src="script.js"></script>
 </body>
 </html>
