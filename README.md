@@ -7,10 +7,13 @@ Simple HTML/CSS/JavaScript messenger using Supabase.
 1. Create a Supabase project.
 2. Open SQL Editor.
 3. Run `schema.sql`.
-4. In `script.js`, set:
+4. Go to Authentication -> Providers -> Email.
+5. Turn OFF **Confirm email** for this private two-person project.
+6. In `script.js`, set:
    - `SUPABASE_URL`
    - `SUPABASE_PUBLISHABLE_KEY`
 
+The UI uses only **Username + Password**. A hidden internal email is generated for Supabase Auth.
 Never put a Supabase Secret Key in this frontend.
 
 ## 2. GitHub
