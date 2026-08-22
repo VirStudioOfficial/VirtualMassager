@@ -56,6 +56,17 @@ let typingPingTimer = null;
 let typingStaleTimer = null;
 let isOtherTyping = false;
 let localSeq = 0;             // for temp ids on optimistic messages
+let pendingDestructSeconds = null; // self-destruct duration chosen for the next send, or null
+let reactionsChannel = null;
+let currentMessageReactions = new Map(); // messageId -> [{ user_id, emoji }]
+let showingArchived = false;  // toggles between normal chat list and archived list
+const REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+const MUTE_DURATIONS = {
+  "1h": 60 * 60 * 1000,
+  "8h": 8 * 60 * 60 * 1000,
+  "24h": 24 * 60 * 60 * 1000
+  // "always" is handled separately (far-future timestamp)
+};
 
 // ===============================
 // 3) DOM
@@ -206,6 +217,7 @@ function resetCallSignalingState() {
 
 function cleanupAllChannels() {
   if (messagesChannel) { sb.removeChannel(messagesChannel); messagesChannel = null; }
+  if (reactionsChannel) { sb.removeChannel(reactionsChannel); reactionsChannel = null; }
   if (typingChannel) { sb.removeChannel(typingChannel); typingChannel = null; }
   if (onlineChannel) { sb.removeChannel(onlineChannel); onlineChannel = null; }
   if (callSignalsChannel) { sb.removeChannel(callSignalsChannel); callSignalsChannel = null; }
@@ -213,6 +225,7 @@ function cleanupAllChannels() {
   if (incomingCallsChannel) { sb.removeChannel(incomingCallsChannel); incomingCallsChannel = null; }
   clearTimeout(typingPingTimer);
   clearTimeout(typingStaleTimer);
+  clearInterval(destructSweepTimer);
 }
 
 // ===============================
@@ -300,7 +313,34 @@ async function ensureProfile() {
   $("myUsername").textContent = "@" + myProfile.username;
   $("myDisplayName").textContent = myProfile.display_name || myProfile.username;
   $("myAvatar").innerHTML = avatarHtml(myProfile);
+  applyTheme(myProfile.theme_preference || "system");
 }
+
+// ---- Theme ----
+function applyTheme(preference) {
+  const effective = preference === "system"
+    ? (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
+    : preference;
+  document.documentElement.setAttribute("data-theme", effective);
+
+  document.querySelectorAll("#themeSwitch button").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.theme === preference);
+  });
+}
+
+$("themeSwitch").addEventListener("click", async (e) => {
+  const preference = e.target.dataset.theme;
+  if (!preference) return;
+  applyTheme(preference);
+
+  const { error } = await sb
+    .from("profiles")
+    .update({ theme_preference: preference })
+    .eq("id", currentUser.id);
+
+  if (error) return toast(error.message);
+  myProfile.theme_preference = preference;
+});
 
 // ===============================
 // 5b) Profile settings
@@ -325,6 +365,18 @@ function openSettingsModal() {
 function closeSettingsModal() {
   $("settingsModal").classList.add("hidden");
 }
+
+$("archiveToggleButton").addEventListener("click", async () => {
+  showingArchived = true;
+  $("archivedBanner").classList.remove("hidden");
+  await loadChats();
+});
+
+$("backFromArchiveButton").addEventListener("click", async () => {
+  showingArchived = false;
+  $("archivedBanner").classList.add("hidden");
+  await loadChats();
+});
 
 $("openSettings").addEventListener("click", openSettingsModal);
 $("settingsButton").addEventListener("click", openSettingsModal);
@@ -496,9 +548,9 @@ async function searchUsers() {
 // ===============================
 async function loadChats() {
   // Single RPC call replaces what used to be 1 + N*2 separate queries.
-  // See get_chat_list() in fix_n1_query.sql — it does the join,
-  // last-message, and unread-count work in one query on the server.
-  const { data, error } = await sb.rpc("get_chat_list");
+  // See get_chat_list() in fix_n1_query.sql / feature_additions.sql — it does
+  // the join, last-message, unread-count, and pin/mute/archive work server-side.
+  const { data, error } = await sb.rpc("get_chat_list", { p_include_archived: showingArchived });
 
   if (error) {
     toast(error.message);
@@ -506,14 +558,15 @@ async function loadChats() {
   }
 
   const chatList = $("chatList");
+  const rows = showingArchived ? (data || []).filter(row => row.archived_at) : (data || []).filter(row => !row.archived_at);
 
-  if (!data || !data.length) {
-    chatList.innerHTML = `<div class="empty-state" style="padding:25px">هنوز گفتگویی نداری.</div>`;
+  if (!rows.length) {
+    chatList.innerHTML = `<div class="empty-state" style="padding:25px">${showingArchived ? "آرشیوی نداری." : "هنوز گفتگویی نداری."}</div>`;
     chatsCache = [];
     return;
   }
 
-  chatsCache = data.map(row => ({
+  chatsCache = rows.map(row => ({
     chatId: row.chat_id,
     profile: {
       id: row.other_user_id,
@@ -527,10 +580,106 @@ async function loadChats() {
       created_at: row.last_created_at,
       sender_id: row.last_sender_id
     } : null,
-    unreadCount: row.unread_count || 0
+    unreadCount: row.unread_count || 0,
+    pinnedAt: row.pinned_at,
+    archivedAt: row.archived_at,
+    mutedUntil: row.muted_until
   }));
 
   renderChatList();
+}
+
+function isChatMuted(item) {
+  return !!item.mutedUntil && new Date(item.mutedUntil).getTime() > Date.now();
+}
+
+async function togglePinChat(chatId) {
+  const item = chatsCache.find(c => c.chatId === chatId);
+  if (!item) return;
+  const nextValue = item.pinnedAt ? null : new Date().toISOString();
+  const { error } = await sb
+    .from("chat_members")
+    .update({ pinned_at: nextValue })
+    .eq("chat_id", chatId)
+    .eq("user_id", currentUser.id);
+  if (error) return toast(error.message);
+  await loadChats();
+}
+
+async function setMuteChat(chatId, durationKey) {
+  let mutedUntil = null;
+  if (durationKey === "always") {
+    mutedUntil = new Date("2999-01-01").toISOString();
+  } else if (durationKey && MUTE_DURATIONS[durationKey]) {
+    mutedUntil = new Date(Date.now() + MUTE_DURATIONS[durationKey]).toISOString();
+  } // durationKey === "off" / falsy -> mutedUntil stays null (unmute)
+
+  const { error } = await sb
+    .from("chat_members")
+    .update({ muted_until: mutedUntil })
+    .eq("chat_id", chatId)
+    .eq("user_id", currentUser.id);
+  if (error) return toast(error.message);
+  toast(mutedUntil ? "چت بی‌صدا شد." : "چت باصدا شد.");
+  await loadChats();
+}
+
+async function toggleArchiveChat(chatId) {
+  const item = chatsCache.find(c => c.chatId === chatId);
+  if (!item) return;
+  const nextValue = item.archivedAt ? null : new Date().toISOString();
+  const { error } = await sb
+    .from("chat_members")
+    .update({ archived_at: nextValue })
+    .eq("chat_id", chatId)
+    .eq("user_id", currentUser.id);
+  if (error) return toast(error.message);
+  toast(nextValue ? "چت آرشیو شد." : "چت از آرشیو خارج شد.");
+  await loadChats();
+}
+
+// "Clear history" = delete for me only. Sets a per-member timestamp; the
+// other person's copy of the chat and its messages are untouched.
+async function clearChatHistory(chatId) {
+  if (!confirm("تاریخچه‌ی این گفتگو فقط برای شما پاک بشه؟ (طرف مقابل هنوز می‌بینه)")) return;
+
+  const { error } = await sb
+    .from("chat_members")
+    .update({ cleared_at: new Date().toISOString() })
+    .eq("chat_id", chatId)
+    .eq("user_id", currentUser.id);
+
+  if (error) return toast(error.message);
+
+  if (currentChatId === chatId) {
+    currentMessagesCache = [];
+    renderMessages(currentMessagesCache);
+  }
+  toast("تاریخچه پاک شد.");
+  await loadChats();
+}
+
+// "Delete for everyone" = removes the chat row entirely; messages cascade
+// with it (see schema). Irreversible for both members, so confirm clearly.
+async function deleteChatForEveryone(chatId) {
+  if (!confirm("این گفتگو برای هر دو نفر حذف بشه؟ این کار برگشت‌ناپذیره.")) return;
+
+  const { error } = await sb.from("chats").delete().eq("id", chatId);
+  if (error) return toast(error.message);
+
+  if (currentChatId === chatId) {
+    currentChatId = null;
+    currentOtherUser = null;
+    $("messages").innerHTML = `<div class="empty-state">از سمت راست یک گفتگو انتخاب کن 👉</div>`;
+    $("chatTitle").textContent = "یک گفتگو انتخاب کن";
+    $("chatStatus").textContent = "";
+    $("messageForm").classList.add("hidden");
+    $("voiceCallButton").classList.add("hidden");
+    $("videoCallButton").classList.add("hidden");
+    $("chatHeaderAvatar").classList.add("hidden");
+  }
+  toast("گفتگو حذف شد.");
+  await loadChats();
 }
 
 function renderChatList() {
@@ -542,43 +691,98 @@ function renderChatList() {
     let previewText = "شروع گفتگو کن 👋";
 
     if (lm) {
-      if (lm.content) {
-        previewText = (lm.sender_id === currentUser.id ? "شما: " : "") + lm.content;
-      } else if (lm.attachment_type === "image") {
-        previewText = (lm.sender_id === currentUser.id ? "شما: " : "") + "📷 عکس";
-      } else if (lm.attachment_type === "file") {
-        previewText = (lm.sender_id === currentUser.id ? "شما: " : "") + "📎 فایل";
-      }
+      const prefix = lm.sender_id === currentUser.id ? "شما: " : "";
+      previewText = prefix + messagePreviewLabel(lm);
     }
 
     const isTypingHere = isOtherTyping && currentChatId === item.chatId;
+    const muted = isChatMuted(item);
 
     return `
-      <div class="chat-item ${currentChatId === item.chatId ? "active" : ""}" data-chat-id="${item.chatId}" data-user-id="${p.id}">
+      <div class="chat-item ${currentChatId === item.chatId ? "active" : ""} ${item.pinnedAt ? "pinned" : ""}" data-chat-id="${item.chatId}" data-user-id="${p.id}">
         <div class="avatar">
           ${avatarHtml(p)}
           ${onlineUsers.has(p.id) ? '<span class="online-dot"></span>' : ''}
         </div>
         <div class="info">
           <div class="name-row">
-            <div class="name"><span class="truncate">${escapeHtml(p.display_name || p.username)}</span></div>
+            <div class="name">
+              ${item.pinnedAt ? '<span class="pin-indicator" title="پین شده">📌</span>' : ""}
+              <span class="truncate">${escapeHtml(p.display_name || p.username)}</span>
+              ${muted ? '<span class="mute-indicator" title="بی‌صدا">🔕</span>' : ""}
+            </div>
             <span class="time">${lm ? formatListTime(lm.created_at) : ""}</span>
           </div>
           <div class="preview-row">
             <div class="preview ${isTypingHere ? "typing" : ""}">${isTypingHere ? "در حال نوشتن..." : escapeHtml(previewText)}</div>
-            ${item.unreadCount > 0 ? `<span class="unread-badge">${item.unreadCount > 99 ? "99+" : item.unreadCount}</span>` : ""}
+            ${item.unreadCount > 0 ? `<span class="unread-badge ${muted ? "muted" : ""}">${item.unreadCount > 99 ? "99+" : item.unreadCount}</span>` : ""}
           </div>
         </div>
+        <button class="icon-button chat-item-menu-btn" data-chat-menu="${item.chatId}" title="گزینه‌ها" type="button">⋮</button>
       </div>
     `;
   }).join("");
 
   chatList.querySelectorAll(".chat-item").forEach(el => {
-    el.addEventListener("click", async () => {
+    el.addEventListener("click", async (e) => {
+      if (e.target.closest("[data-chat-menu]")) return; // menu button handled separately
       const item = chatsCache.find(c => c.chatId === el.dataset.chatId);
       openChat(el.dataset.chatId, item ? item.profile : await getProfile(el.dataset.userId));
     });
   });
+
+  chatList.querySelectorAll("[data-chat-menu]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openChatItemMenu(btn.dataset.chatMenu, btn);
+    });
+  });
+}
+
+// ---- Chat item context menu (pin / mute / archive) ----
+function closeChatItemMenu() {
+  document.querySelector(".chat-item-menu")?.remove();
+  document.removeEventListener("click", closeChatItemMenu);
+}
+
+function openChatItemMenu(chatId, anchorEl) {
+  closeChatItemMenu();
+  const item = chatsCache.find(c => c.chatId === chatId);
+  if (!item) return;
+
+  const menu = document.createElement("div");
+  menu.className = "chat-item-menu";
+  menu.innerHTML = `
+    <button data-action="pin">${item.pinnedAt ? "برداشتن پین" : "پین کردن"}</button>
+    <button data-action="mute-1h">بی‌صدا ۱ ساعت</button>
+    <button data-action="mute-8h">بی‌صدا ۸ ساعت</button>
+    <button data-action="mute-24h">بی‌صدا ۲۴ ساعت</button>
+    <button data-action="mute-always">بی‌صدا همیشه</button>
+    ${isChatMuted(item) ? `<button data-action="unmute">باصدا کردن</button>` : ""}
+    <button data-action="archive">${item.archivedAt ? "خروج از آرشیو" : "آرشیو کردن"}</button>
+    <div class="chat-item-menu-divider"></div>
+    <button data-action="clear" class="danger-text">پاک کردن تاریخچه (فقط برای من)</button>
+    <button data-action="delete-everyone" class="danger-text">حذف برای همه</button>
+  `;
+  document.body.appendChild(menu);
+
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.top = `${rect.bottom + window.scrollY + 4}px`;
+  menu.style.left = `${rect.left + window.scrollX - 140}px`;
+
+  menu.addEventListener("click", async (e) => {
+    const action = e.target.dataset.action;
+    if (!action) return;
+    closeChatItemMenu();
+    if (action === "pin") await togglePinChat(chatId);
+    else if (action === "clear") await clearChatHistory(chatId);
+    else if (action === "delete-everyone") await deleteChatForEveryone(chatId);
+    else if (action === "archive") await toggleArchiveChat(chatId);
+    else if (action === "unmute") await setMuteChat(chatId, "off");
+    else if (action.startsWith("mute-")) await setMuteChat(chatId, action.replace("mute-", ""));
+  });
+
+  setTimeout(() => document.addEventListener("click", closeChatItemMenu), 0);
 }
 
 async function getProfile(userId) {
@@ -665,6 +869,7 @@ async function openChat(chatId, otherUser) {
 
   await loadMessages();
   subscribeToMessages();
+  subscribeToReactions();
   subscribeToTyping();
   await markChatAsRead();
 }
@@ -679,12 +884,29 @@ $("backButton").addEventListener("click", () => {
 async function loadMessages() {
   const chatIdAtCall = currentChatId;
 
-  const { data, error } = await sb
+  // Fetch this member's own clear-point for the chat, so cleared history
+  // stays hidden on this device without affecting the other member.
+  const { data: memberRow } = await sb
+    .from("chat_members")
+    .select("cleared_at")
+    .eq("chat_id", currentChatId)
+    .eq("user_id", currentUser.id)
+    .single();
+
+  if (currentChatId !== chatIdAtCall) return;
+
+  let query = sb
     .from("messages")
-    .select("id, sender_id, content, attachment_url, attachment_type, attachment_name, created_at, edited_at, read_at, reply_to_id, forwarded_from_id")
+    .select("id, sender_id, content, attachment_url, attachment_type, attachment_name, created_at, edited_at, read_at, reply_to_id, forwarded_from_id, destroy_at, location_lat, location_lng, contact_name, contact_phone")
     .eq("chat_id", currentChatId)
     .order("created_at", { ascending: true })
     .limit(200);
+
+  if (memberRow?.cleared_at) {
+    query = query.gt("created_at", memberRow.cleared_at);
+  }
+
+  const { data, error } = await query;
 
   // The user may have switched chats while this request was in flight —
   // discard the stale result instead of overwriting the newer chat's messages.
@@ -695,8 +917,75 @@ async function loadMessages() {
     return;
   }
 
-  currentMessagesCache = data || [];
+  // Drop messages this user deleted "for me" locally, and any whose
+  // self-destruct timer has already passed (belt-and-suspenders alongside
+  // the periodic sweep — see sweepExpiredMessages()).
+  const hiddenIds = await getHiddenMessageIds((data || []).map(m => m.id));
+  const now = Date.now();
+  currentMessagesCache = (data || []).filter(m =>
+    !hiddenIds.has(m.id) && !(m.destroy_at && new Date(m.destroy_at).getTime() <= now)
+  );
+
+  await loadReactionsForChat(currentChatId, chatIdAtCall);
   renderMessages(currentMessagesCache);
+  scheduleDestructSweep();
+}
+
+async function getHiddenMessageIds(messageIds) {
+  if (!messageIds.length) return new Set();
+  const { data, error } = await sb
+    .from("message_hidden_for")
+    .select("message_id")
+    .eq("user_id", currentUser.id)
+    .in("message_id", messageIds);
+  if (error) return new Set(); // fail open — better to show a message than crash the view
+  return new Set((data || []).map(r => r.message_id));
+}
+
+// ---- Self-destruct sweep ----
+// There is no server-side cron in this project, so expiry is enforced by
+// whichever client happens to be open: on loading a chat, and every 5s while
+// one is open, expired messages get deleted from the DB (RLS allows either
+// member to delete once destroy_at has passed) and dropped from the view.
+// A message will not vanish if neither side has the chat open at expiry time
+// — it disappears the next time someone opens it instead of exactly on time.
+let destructSweepTimer = null;
+
+function scheduleDestructSweep() {
+  clearInterval(destructSweepTimer);
+  destructSweepTimer = setInterval(sweepExpiredMessages, 5000);
+}
+
+async function sweepExpiredMessages() {
+  if (!currentChatId) return;
+  const now = Date.now();
+  const expired = currentMessagesCache.filter(m => m.destroy_at && new Date(m.destroy_at).getTime() <= now);
+  if (!expired.length) return;
+
+  for (const m of expired) {
+    await sb.from("messages").delete().eq("id", m.id); // best-effort; realtime DELETE event will also confirm removal for the other side
+  }
+  currentMessagesCache = currentMessagesCache.filter(m => !expired.some(e => e.id === m.id));
+  renderMessages(currentMessagesCache);
+}
+
+async function loadReactionsForChat(chatId, chatIdAtCall) {
+  const ids = currentMessagesCache.map(m => m.id).filter(id => !id.toString().startsWith("temp-"));
+  currentMessageReactions = new Map();
+  if (!ids.length) return;
+
+  const { data, error } = await sb
+    .from("message_reactions")
+    .select("message_id, user_id, emoji")
+    .in("message_id", ids);
+
+  if (currentChatId !== chatIdAtCall) return; // stale response from a chat switch
+  if (error) return; // reactions are non-critical — fail silently, message list still renders
+
+  for (const row of data || []) {
+    if (!currentMessageReactions.has(row.message_id)) currentMessageReactions.set(row.message_id, []);
+    currentMessageReactions.get(row.message_id).push(row);
+  }
 }
 
 function findCachedMessage(id) {
@@ -728,8 +1017,10 @@ function renderMessage(message) {
   const mine = message.sender_id === currentUser.id;
   const pending = message.id.toString().startsWith("temp-");
   const selected = selectedMessageIds.has(message.id);
+  const withinDeleteForEveryoneWindow = mine && (Date.now() - new Date(message.created_at).getTime()) <= 48 * 60 * 60 * 1000;
 
   const actionButtons = [
+    `<button data-react="${message.id}" title="واکنش">😊</button>`,
     `<button data-reply="${message.id}">پاسخ</button>`,
     `<button data-forward="${message.id}">فوروارد</button>`
   ];
@@ -740,7 +1031,12 @@ function renderMessage(message) {
     if (!message.attachment_url) {
       actionButtons.push(`<button data-edit="${message.id}">ویرایش</button>`);
     }
-    actionButtons.push(`<button class="delete" data-delete="${message.id}">حذف</button>`);
+  }
+  if (!pending) {
+    actionButtons.push(`<button data-delete-for-me="${message.id}">حذف برای من</button>`);
+    if (withinDeleteForEveryoneWindow) {
+      actionButtons.push(`<button class="delete" data-delete="${message.id}">حذف برای همه</button>`);
+    }
   }
   const actions = pending ? "" : `<div class="message-actions">${actionButtons.join("")}</div>`;
 
@@ -756,16 +1052,46 @@ function renderMessage(message) {
         </a>
       `;
     }
+  } else if (message.attachment_type === "location" && message.location_lat != null) {
+    const mapUrl = `https://www.openstreetmap.org/?mlat=${message.location_lat}&mlon=${message.location_lng}#map=15/${message.location_lat}/${message.location_lng}`;
+    mediaHtml = `
+      <a class="message-location" href="${escapeHtml(mapUrl)}" target="_blank" rel="noopener">
+        <span class="file-icon">📍</span>
+        <span>مشاهده موقعیت روی نقشه</span>
+      </a>
+    `;
+  } else if (message.attachment_type === "contact") {
+    mediaHtml = `
+      <div class="message-contact">
+        <span class="file-icon">👤</span>
+        <span class="contact-name">${escapeHtml(message.contact_name || "")}</span>
+        <span class="contact-phone">${escapeHtml(message.contact_phone || "")}</span>
+      </div>
+    `;
   }
 
-  let replyHtml = "";
+// Shared short label for a message when it's referenced elsewhere (reply
+// quotes, reply-preview bar, sidebar last-message line) — covers every
+// attachment type so location/contact messages don't fall through to a
+// generic or misleading label.
+function messagePreviewLabel(message) {
+  if (message.content) return message.content;
+  switch (message.attachment_type) {
+    case "image": return "📷 عکس";
+    case "location": return "📍 موقعیت مکانی";
+    case "contact": return "👤 مخاطب";
+    default: return "📎 فایل";
+  }
+}
+
+let replyHtml = "";
   if (message.reply_to_id) {
     const original = findCachedMessage(message.reply_to_id);
     if (original) {
       const originalMine = original.sender_id === currentUser.id;
       const originalPreview = original.content
         ? escapeHtml(original.content).slice(0, 80)
-        : (original.attachment_type === "image" ? "📷 عکس" : "📎 فایل");
+        : escapeHtml(messagePreviewLabel(original));
       replyHtml = `
         <div class="reply-quote" data-jump-to="${original.id}">
           <strong>${originalMine ? "شما" : escapeHtml(currentOtherUser?.display_name || currentOtherUser?.username || "")}</strong>
@@ -792,6 +1118,9 @@ function renderMessage(message) {
     ? `<label class="message-select"><input type="checkbox" data-select-checkbox="${message.id}" ${selected ? "checked" : ""}></label>`
     : "";
 
+  const reactionsForMessage = currentMessageReactions.get(message.id) || [];
+  const reactionHtml = reactionsForMessage.length ? renderReactionChips(message.id, reactionsForMessage) : "";
+
   return `
     <div class="message ${mine ? "mine" : ""} ${pending ? "pending" : ""} ${selected ? "selected" : ""}" data-message-id="${message.id}">
       ${checkboxHtml}
@@ -804,9 +1133,108 @@ function renderMessage(message) {
         <span>${formatTime(message.created_at)}</span>
         ${readTick}
       </div>
+      ${reactionHtml}
       ${actions}
     </div>
   `;
+}
+
+// Groups reactions by emoji into small tappable chips, e.g. "👍 2" — highlighted
+// if the current user is among the reactors (tapping toggles their own reaction off).
+function renderReactionChips(messageId, reactions) {
+  const counts = new Map();
+  for (const r of reactions) {
+    if (!counts.has(r.emoji)) counts.set(r.emoji, []);
+    counts.get(r.emoji).push(r.user_id);
+  }
+  const chips = [...counts.entries()].map(([emoji, userIds]) => {
+    const mineReacted = userIds.includes(currentUser.id);
+    return `<button class="reaction-chip ${mineReacted ? "mine" : ""}" data-reaction-chip="${messageId}" data-emoji="${emoji}">${emoji} <span>${userIds.length}</span></button>`;
+  }).join("");
+  return `<div class="reaction-row">${chips}</div>`;
+}
+
+// ---- Reactions ----
+function openReactionPicker(messageId, anchorEl) {
+  document.querySelector(".reaction-picker")?.remove();
+
+  const picker = document.createElement("div");
+  picker.className = "reaction-picker";
+  picker.innerHTML = REACTION_EMOJIS.map(e => `<button data-pick-emoji="${e}">${e}</button>`).join("");
+  document.body.appendChild(picker);
+
+  const rect = anchorEl.getBoundingClientRect();
+  picker.style.top = `${rect.top + window.scrollY - 46}px`;
+  picker.style.left = `${rect.left + window.scrollX - 100}px`;
+
+  const closePicker = () => {
+    picker.remove();
+    document.removeEventListener("click", closePicker);
+  };
+
+  picker.addEventListener("click", async (e) => {
+    const emoji = e.target.dataset.pickEmoji;
+    if (!emoji) return;
+    closePicker();
+    await toggleReaction(messageId, emoji);
+  });
+
+  setTimeout(() => document.addEventListener("click", closePicker), 0);
+}
+
+async function toggleReaction(messageId, emoji) {
+  const existing = (currentMessageReactions.get(messageId) || []).find(r => r.user_id === currentUser.id);
+
+  if (existing && existing.emoji === emoji) {
+    // Tapping the same emoji again removes it.
+    const { error } = await sb
+      .from("message_reactions")
+      .delete()
+      .eq("message_id", messageId)
+      .eq("user_id", currentUser.id);
+    if (error) toast(error.message);
+    return;
+  }
+
+  // Upsert: one reaction per user per message, so picking a new emoji replaces the old one.
+  const { error } = await sb
+    .from("message_reactions")
+    .upsert({ message_id: messageId, user_id: currentUser.id, emoji }, { onConflict: "message_id,user_id" });
+  if (error) toast(error.message);
+}
+
+function subscribeToReactions() {
+  if (reactionsChannel) {
+    sb.removeChannel(reactionsChannel);
+    reactionsChannel = null;
+  }
+
+  const chatIdAtSubscribe = currentChatId;
+
+  reactionsChannel = sb
+    .channel(`reactions-${currentChatId}`)
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "message_reactions" },
+      (payload) => {
+        if (currentChatId !== chatIdAtSubscribe) return;
+        const row = payload.new?.message_id ? payload.new : payload.old;
+        // Only re-render if this reaction belongs to a message currently on screen.
+        if (!currentMessagesCache.some(m => m.id === row.message_id)) return;
+
+        if (payload.eventType === "DELETE") {
+          const list = currentMessageReactions.get(row.message_id) || [];
+          currentMessageReactions.set(row.message_id, list.filter(r => r.user_id !== row.user_id));
+        } else {
+          const list = currentMessageReactions.get(row.message_id) || [];
+          const filtered = list.filter(r => r.user_id !== row.user_id);
+          filtered.push({ message_id: row.message_id, user_id: row.user_id, emoji: row.emoji });
+          currentMessageReactions.set(row.message_id, filtered);
+        }
+        renderMessages(currentMessagesCache);
+      }
+    )
+    .subscribe();
 }
 
 function attachMessageActions() {
@@ -823,7 +1251,7 @@ function attachMessageActions() {
 
   document.querySelectorAll("[data-delete]").forEach(btn => {
     btn.addEventListener("click", async () => {
-      if (!confirm("این پیام حذف شود؟")) return;
+      if (!confirm("این پیام برای هر دو نفر حذف بشه؟")) return;
 
       const { error } = await sb
         .from("messages")
@@ -835,9 +1263,37 @@ function attachMessageActions() {
     });
   });
 
+  document.querySelectorAll("[data-delete-for-me]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const messageId = btn.dataset.deleteForMe;
+      const { error } = await sb
+        .from("message_hidden_for")
+        .upsert({ message_id: messageId, user_id: currentUser.id }, { onConflict: "message_id,user_id" });
+      if (error) return toast(error.message);
+
+      currentMessagesCache = currentMessagesCache.filter(m => m.id !== messageId);
+      renderMessages(currentMessagesCache);
+      toast("پیام برای شما حذف شد.");
+    });
+  });
+
   document.querySelectorAll("[data-reply]").forEach(btn => {
     btn.addEventListener("click", () => {
       startReply(btn.dataset.reply);
+    });
+  });
+
+  document.querySelectorAll("[data-react]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openReactionPicker(btn.dataset.react, btn);
+    });
+  });
+
+  document.querySelectorAll("[data-reaction-chip]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleReaction(btn.dataset.reactionChip, btn.dataset.emoji);
     });
   });
 
@@ -914,7 +1370,7 @@ function startReply(messageId) {
   const senderName = mine ? "شما" : (currentOtherUser?.display_name || currentOtherUser?.username || "");
   const preview = message.content
     ? message.content.slice(0, 100)
-    : (message.attachment_type === "image" ? "📷 عکس" : "📎 فایل");
+    : messagePreviewLabel(message);
 
   $("replyPreviewSender").textContent = senderName;
   $("replyPreviewText").textContent = preview;
@@ -973,6 +1429,10 @@ async function forwardMessage(messageId, targetChatId) {
     attachment_url: original.attachment_url,
     attachment_type: original.attachment_type,
     attachment_name: original.attachment_name,
+    location_lat: original.location_lat ?? null,
+    location_lng: original.location_lng ?? null,
+    contact_name: original.contact_name ?? null,
+    contact_phone: original.contact_phone ?? null,
     forwarded_from_id: original.id
   });
 
@@ -1083,6 +1543,140 @@ function clearAttachment() {
   $("attachmentPreviewImg").src = "";
 }
 
+// ---- Self-destruct timer ----
+$("destructTimerButton").addEventListener("click", (e) => {
+  e.stopPropagation();
+  openDestructTimerMenu($("destructTimerButton"));
+});
+
+function openDestructTimerMenu(anchorEl) {
+  document.querySelector(".destruct-timer-menu")?.remove();
+
+  const menu = document.createElement("div");
+  menu.className = "destruct-timer-menu";
+  const options = [
+    { key: null, label: "بدون تایمر" },
+    { key: 5, label: "۵ ثانیه" },
+    { key: 10, label: "۱۰ ثانیه" },
+    { key: 30, label: "۳۰ ثانیه" },
+    { key: 60, label: "۱ دقیقه" }
+  ];
+  menu.innerHTML = options.map(o =>
+    `<button data-seconds="${o.key ?? ""}" class="${pendingDestructSeconds === o.key ? "active" : ""}">${o.label}</button>`
+  ).join("");
+  document.body.appendChild(menu);
+
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.bottom = `${window.innerHeight - rect.top - window.scrollY + 6}px`;
+  menu.style.left = `${rect.left + window.scrollX - 60}px`;
+
+  const close = () => { menu.remove(); document.removeEventListener("click", close); };
+  menu.addEventListener("click", (e2) => {
+    const raw = e2.target.dataset.seconds;
+    if (raw === undefined) return;
+    pendingDestructSeconds = raw === "" ? null : Number(raw);
+    $("destructTimerButton").classList.toggle("active", pendingDestructSeconds !== null);
+    close();
+  });
+  setTimeout(() => document.addEventListener("click", close), 0);
+}
+
+// ---- Location & contact share ----
+$("shareExtrasButton").addEventListener("click", (e) => {
+  e.stopPropagation();
+  openShareExtrasMenu($("shareExtrasButton"));
+});
+
+function openShareExtrasMenu(anchorEl) {
+  document.querySelector(".share-extras-menu")?.remove();
+
+  const menu = document.createElement("div");
+  menu.className = "share-extras-menu";
+  menu.innerHTML = `
+    <button data-share="location">📍 اشتراک موقعیت</button>
+    <button data-share="contact">👤 اشتراک مخاطب</button>
+  `;
+  document.body.appendChild(menu);
+
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.bottom = `${window.innerHeight - rect.top - window.scrollY + 6}px`;
+  menu.style.left = `${rect.left + window.scrollX - 60}px`;
+
+  const close = () => { menu.remove(); document.removeEventListener("click", close); };
+  menu.addEventListener("click", async (e2) => {
+    const type = e2.target.dataset.share;
+    if (!type) return;
+    close();
+    if (type === "location") await shareLocation();
+    else if (type === "contact") openContactShareModal();
+  });
+  setTimeout(() => document.addEventListener("click", close), 0);
+}
+
+async function shareLocation() {
+  if (!navigator.geolocation) return toast("مرورگر شما از موقعیت مکانی پشتیبانی نمی‌کند.");
+  if (!currentChatId) return toast("اول یک گفتگو انتخاب کن.");
+
+  toast("در حال گرفتن موقعیت...");
+  navigator.geolocation.getCurrentPosition(
+    async (position) => {
+      const { latitude, longitude } = position.coords;
+      const { error } = await sb.from("messages").insert({
+        chat_id: currentChatId,
+        sender_id: currentUser.id,
+        attachment_type: "location",
+        location_lat: latitude,
+        location_lng: longitude,
+        destroy_at: destructAtFromPending()
+      });
+      if (error) toast(error.message);
+    },
+    () => toast("اجازه‌ی دسترسی به موقعیت داده نشد."),
+    { enableHighAccuracy: false, timeout: 10000 }
+  );
+}
+
+function openContactShareModal() {
+  $("contactShareName").value = "";
+  $("contactShareId").value = "";
+  $("contactShareModal").classList.remove("hidden");
+  $("contactShareName").focus();
+}
+
+$("cancelContactShare").addEventListener("click", () => {
+  $("contactShareModal").classList.add("hidden");
+});
+
+$("saveContactShare").addEventListener("click", async () => {
+  const name = $("contactShareName").value.trim();
+  const phone = $("contactShareId").value.trim();
+  if (!name || !phone) return toast("نام و شماره تلفن را وارد کن.");
+  if (!currentChatId) return toast("اول یک گفتگو انتخاب کن.");
+
+  const { error } = await sb.from("messages").insert({
+    chat_id: currentChatId,
+    sender_id: currentUser.id,
+    attachment_type: "contact",
+    contact_name: name,
+    contact_phone: phone,
+    destroy_at: destructAtFromPending()
+  });
+
+  if (error) return toast(error.message);
+  $("contactShareModal").classList.add("hidden");
+});
+
+// Converts the currently-picked self-destruct duration into an absolute
+// timestamp at send time, or null if no timer is set. Reset after each use
+// so the timer doesn't silently apply to unrelated later messages.
+function destructAtFromPending() {
+  if (!pendingDestructSeconds) return null;
+  const at = new Date(Date.now() + pendingDestructSeconds * 1000).toISOString();
+  pendingDestructSeconds = null;
+  $("destructTimerButton").classList.remove("active");
+  return at;
+}
+
 async function uploadAttachment(file) {
   const ext = file.name.includes(".") ? file.name.split(".").pop() : "bin";
   const path = `${currentUser.id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
@@ -1112,6 +1706,7 @@ $("messageForm").addEventListener("submit", async (e) => {
   sendingLock = true;
 
   const replyToId = replyingToMessageId;
+  const destroyAt = destructAtFromPending();
 
   input.value = "";
   clearAttachment();
@@ -1135,7 +1730,8 @@ $("messageForm").addEventListener("submit", async (e) => {
     edited_at: null,
     read_at: null,
     reply_to_id: replyToId || null,
-    forwarded_from_id: null
+    forwarded_from_id: null,
+    destroy_at: destroyAt
   };
 
   currentMessagesCache.push(optimisticMessage);
@@ -1163,7 +1759,8 @@ $("messageForm").addEventListener("submit", async (e) => {
         attachment_url,
         attachment_type,
         attachment_name,
-        reply_to_id: replyToId || null
+        reply_to_id: replyToId || null,
+        destroy_at: destroyAt
       });
 
     if (error) throw error;
@@ -1173,6 +1770,7 @@ $("messageForm").addEventListener("submit", async (e) => {
     const tempEl = box.querySelector(`[data-message-id="${tempId}"]`);
     if (tempEl) tempEl.remove();
     currentMessagesCache = currentMessagesCache.filter(m => m.id !== tempId);
+    scheduleDestructSweep();
   } catch (error) {
     toast(error.message || "ارسال پیام ناموفق بود.");
     const tempEl = box.querySelector(`[data-message-id="${tempId}"]`);
