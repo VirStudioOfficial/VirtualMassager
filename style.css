@@ -499,7 +499,9 @@ html, body {
 
 .message-actions {
   display: none;
+  flex-wrap: wrap;
   gap: 4px;
+  max-width: 220px;
   position: absolute;
   top: -14px;
   left: 6px;
@@ -507,6 +509,7 @@ html, body {
   border-radius: 8px;
   padding: 2px;
   box-shadow: 0 4px 14px #0006;
+  z-index: 5;
 }
 
 .message:hover .message-actions { display: flex; }
@@ -520,6 +523,81 @@ html, body {
 
 .message-actions button:hover { background: #ffffff1a; }
 .message-actions .delete { color: #ff9d9d; }
+
+.reply-quote {
+  background: #0003;
+  border-right: 3px solid var(--accent2);
+  border-radius: 8px;
+  padding: 5px 8px;
+  margin-bottom: 5px;
+  cursor: pointer;
+}
+
+.reply-quote strong {
+  display: block;
+  font-size: 11.5px;
+  color: var(--accent2);
+}
+
+.reply-quote span {
+  display: block;
+  font-size: 12.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.forwarded-label {
+  font-size: 11px;
+  color: var(--muted);
+  font-style: italic;
+  margin-bottom: 3px;
+}
+
+.flash-highlight {
+  animation: flash-bg 0.9s ease;
+}
+
+@keyframes flash-bg {
+  0%, 100% { box-shadow: none; }
+  30% { box-shadow: 0 0 0 3px var(--accent2); }
+}
+
+.message-select {
+  position: absolute;
+  top: 6px;
+  right: -26px;
+}
+
+.message.selected {
+  outline: 2px solid var(--accent);
+}
+
+.incoming-call-card {
+  text-align: center;
+}
+
+.incoming-call-subtitle {
+  color: var(--muted);
+  margin: 0 0 6px;
+  font-size: 13.5px;
+}
+
+.call-card h3 { text-align: center; }
+
+.selection-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  background: var(--panel2);
+  border-bottom: 1px solid var(--border);
+  font-size: 13.5px;
+}
+
+.selection-actions { display: flex; gap: 8px; }
+.selection-actions button { padding: 6px 12px; font-size: 12.5px; }
 
 .typing-indicator {
   align-self: flex-start;
