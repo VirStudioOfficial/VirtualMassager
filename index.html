@@ -101,17 +101,19 @@
       <div id="attachmentPreview" class="attachment-preview hidden">
         <div class="attachment-preview-inner">
           <img id="attachmentPreviewImg" class="hidden" alt="پیش‌نمایش">
+          <video id="attachmentPreviewVideo" class="hidden" muted playsinline></video>
           <div id="attachmentPreviewFile" class="attachment-file-chip hidden">
             <span>📎</span>
             <span id="attachmentPreviewName"></span>
           </div>
+          <span id="attachmentCompressNote" class="attachment-compress-note hidden"></span>
           <button id="removeAttachment" type="button" class="icon-button">✕</button>
         </div>
       </div>
 
       <form id="messageForm" class="message-form hidden">
-        <input id="fileInput" type="file" accept="image/*,.pdf,.zip,.rar,.txt,.doc,.docx" hidden>
-        <button id="attachButton" type="button" class="icon-button" title="پیوست فایل">📎</button>
+        <input id="fileInput" type="file" accept="image/*,video/*,.pdf,.zip,.rar,.txt,.doc,.docx" hidden>
+        <button id="attachButton" type="button" class="icon-button" title="پیوست فایل یا ویدیو">📎</button>
         <button id="shareExtrasButton" type="button" class="icon-button" title="اشتراک‌گذاری">➕</button>
         <button id="destructTimerButton" type="button" class="icon-button" title="تایمر خودتخریب">⏱</button>
         <input id="messageInput" autocomplete="off" placeholder="پیامت رو بنویس...">
@@ -145,6 +147,7 @@
 
   <div id="imageViewer" class="image-viewer hidden">
     <img id="imageViewerImg" alt="عکس">
+    <video id="imageViewerVideo" class="hidden" controls playsinline></video>
   </div>
 
   <div id="settingsModal" class="modal hidden">
