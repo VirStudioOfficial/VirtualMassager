@@ -36,10 +36,16 @@
           </div>
         </div>
         <div class="header-actions">
+          <button id="archiveToggleButton" class="icon-button" title="آرشیو">🗄</button>
           <button id="settingsButton" class="icon-button" title="تنظیمات">⚙</button>
           <button id="logoutButton" class="icon-button" title="خروج">↪</button>
         </div>
       </header>
+
+      <div id="archivedBanner" class="archived-banner hidden">
+        <button id="backFromArchiveButton" class="icon-button" type="button">→</button>
+        <strong>آرشیو</strong>
+      </div>
 
       <div class="search-box">
         <span class="search-icon">🔍</span>
@@ -106,6 +112,8 @@
       <form id="messageForm" class="message-form hidden">
         <input id="fileInput" type="file" accept="image/*,.pdf,.zip,.rar,.txt,.doc,.docx" hidden>
         <button id="attachButton" type="button" class="icon-button" title="پیوست فایل">📎</button>
+        <button id="shareExtrasButton" type="button" class="icon-button" title="اشتراک‌گذاری">➕</button>
+        <button id="destructTimerButton" type="button" class="icon-button" title="تایمر خودتخریب">⏱</button>
         <input id="messageInput" autocomplete="off" placeholder="پیامت رو بنویس...">
         <button id="sendButton" type="submit" class="send-button" title="ارسال">➤</button>
       </form>
@@ -119,6 +127,18 @@
       <div class="modal-actions">
         <button id="cancelEdit" type="button">لغو</button>
         <button id="saveEdit" type="button">ذخیره</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="contactShareModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>اشتراک مخاطب</h3>
+      <input id="contactShareName" type="text" placeholder="نام" maxlength="60">
+      <input id="contactShareId" type="tel" placeholder="شماره تلفن" maxlength="30">
+      <div class="modal-actions">
+        <button id="cancelContactShare" type="button">لغو</button>
+        <button id="saveContactShare" type="button">ارسال</button>
       </div>
     </div>
   </div>
@@ -152,6 +172,15 @@
       <label class="settings-label">بایو</label>
       <textarea id="settingsBio" maxlength="160" placeholder="چند خط درباره‌ی خودت..."></textarea>
       <small class="char-count"><span id="bioCharCount">0</span>/۱۶۰</small>
+
+      <div class="settings-divider"></div>
+
+      <label class="settings-label">تم ظاهری</label>
+      <div class="theme-switch" id="themeSwitch">
+        <button type="button" data-theme="light">☀️ روشن</button>
+        <button type="button" data-theme="dark">🌙 تاریک</button>
+        <button type="button" data-theme="system">🖥 سیستم</button>
+      </div>
 
       <div class="settings-divider"></div>
 
