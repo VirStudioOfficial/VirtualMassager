@@ -46,6 +46,10 @@ let ringTimeoutId = null;
 let incomingCallsChannel = null;
 let isMuted = false;
 let isCameraOff = false;
+let pendingIceCandidates = [];
+let processedSignalIds = new Set();
+let callState = 'idle'; // idle | outgoing | ringing | connecting | connected | ending | ended | failed
+let callGeneration = 0;
 let pendingIncomingCall = null; // { call row, caller profile }
 let chatsCache = [];          // enriched chat list for sidebar
 let typingPingTimer = null;
@@ -195,6 +199,11 @@ $("logoutButton").addEventListener("click", async () => {
 // Cleans up every realtime channel and timers — called on logout and
 // before subscribing to a new chat, to avoid duplicate subscriptions
 // and memory leaks (previously channels could pile up across chat switches).
+function resetCallSignalingState() {
+  pendingIceCandidates = [];
+  processedSignalIds.clear();
+}
+
 function cleanupAllChannels() {
   if (messagesChannel) { sb.removeChannel(messagesChannel); messagesChannel = null; }
   if (typingChannel) { sb.removeChannel(typingChannel); typingChannel = null; }
@@ -1457,7 +1466,10 @@ window.addEventListener("beforeunload", () => {
 const RTC_CONFIG = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" }
-  ]
+    // Add a TURN server here later for stricter NAT/firewall networks.
+  ],
+  bundlePolicy: "max-bundle",
+  rtcpMuxPolicy: "require"
 };
 
 $("voiceCallButton").addEventListener("click", () => startCall("voice"));
@@ -1472,14 +1484,19 @@ function subscribeToCallStatus(callId) {
       "postgres_changes",
       { event: "UPDATE", schema: "public", table: "calls", filter: `id=eq.${callId}` },
       (payload) => {
-        if (payload.new.status === "rejected") {
+        if (callId !== currentCallId) return; // stale call event
+        const status = payload.new.status;
+        if (status === "rejected") {
           toast("تماس رد شد.");
-          endCall(false);
-        } else if (payload.new.status === "missed") {
+          endCall(false, callId);
+        } else if (status === "missed") {
           toast("پاسخ داده نشد.");
-          endCall(false);
-        } else if (payload.new.status === "accepted") {
+          endCall(false, callId);
+        } else if (status === "accepted") {
           stopRingtone();
+          if (callState === "outgoing" || callState === "ringing") callState = "connecting";
+        } else if (status === "ended") {
+          endCall(false, callId);
         }
       }
     )
@@ -1523,6 +1540,9 @@ async function startCall(callType) {
 
   currentCallId = call.id;
   currentCallType = callType;
+  callState = "outgoing";
+  callGeneration++;
+  resetCallSignalingState();
 
   openCallModal(callType);
   startRingtone("outgoing");
@@ -1537,12 +1557,20 @@ async function startCall(callType) {
     if (currentCallId === call.id) {
       await sb.from("calls").update({ status: "missed", ended_at: new Date().toISOString() }).eq("id", call.id);
       toast("پاسخ داده نشد.");
-      endCall(false);
+      endCall(false, call.id);
     }
   }, 30000);
 }
 
 function openCallModal(callType) {
+  const remoteEl = $("remoteVideo");
+  const localEl = $("localVideo");
+  remoteEl.autoplay = true;
+  remoteEl.playsInline = true;
+  remoteEl.muted = false;
+  localEl.autoplay = true;
+  localEl.playsInline = true;
+  localEl.muted = true;
   $("callTitle").textContent = callType === "video" ? "تماس تصویری" : "تماس صوتی";
   $("localVideo").classList.toggle("hidden", callType !== "video");
   $("remoteVideo").classList.toggle("hidden", false);
@@ -1556,67 +1584,148 @@ function openCallModal(callType) {
 
 function closeCallModal() {
   $("callModal").classList.add("hidden");
-  $("localVideo").srcObject = null;
-  $("remoteVideo").srcObject = null;
+  const localEl = $("localVideo");
+  const remoteEl = $("remoteVideo");
+  localEl.pause?.();
+  remoteEl.pause?.();
+  localEl.srcObject = null;
+  remoteEl.srcObject = null;
+  remoteEl.muted = false;
 }
 
 async function createPeerConnection() {
-  pc = new RTCPeerConnection(RTC_CONFIG);
+  const callIdAtCreation = currentCallId;
+  const generationAtCreation = callGeneration;
+  const candidateQueue = [];
+  let disconnectGraceTimer = null;
+  let failedTimer = null;
 
-  localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+  pc = new RTCPeerConnection(RTC_CONFIG);
+  const thisPc = pc;
+
+  if (!localStream) throw new Error("Local media stream is missing");
+  localStream.getTracks().forEach(track => thisPc.addTrack(track, localStream));
 
   remoteStream = new MediaStream();
   const remoteVideoEl = $("remoteVideo");
+  remoteVideoEl.autoplay = true;
+  remoteVideoEl.playsInline = true;
+  remoteVideoEl.muted = false;
   remoteVideoEl.srcObject = remoteStream;
 
-  // Use event.track directly instead of event.streams[0] — more reliable
-  // across browsers/tablets, since some don't reliably populate .streams.
-  pc.ontrack = (event) => {
+  thisPc.ontrack = async (event) => {
+    if (thisPc !== pc || callIdAtCreation !== currentCallId || generationAtCreation !== callGeneration) return;
     if (!remoteStream.getTracks().some(t => t.id === event.track.id)) {
       remoteStream.addTrack(event.track);
     }
-    // Mobile browsers (iOS Safari, some Android WebViews) can silently
-    // block autoplay for a stream attached outside a user-gesture handler —
-    // explicitly call play() and retry once if it's blocked.
-    remoteVideoEl.play().catch(() => {
-      toast("برای شنیدن صدا روی صفحه لمس کن.");
-      const resume = () => {
-        remoteVideoEl.play().catch(() => {});
-        document.removeEventListener("touchstart", resume);
-        document.removeEventListener("click", resume);
-      };
-      document.addEventListener("touchstart", resume, { once: true });
+    event.track.onended = () => {
+      if (thisPc === pc && currentCallId === callIdAtCreation) {
+        // Do not end the whole call for a single media track ending.
+        // A camera track can end while audio remains alive.
+      }
+    };
+    try {
+      await remoteVideoEl.play();
+    } catch {
+      // Browser autoplay policy: retry after a user interaction.
+      const resume = () => remoteVideoEl.play().catch(() => {});
+      document.addEventListener("touchstart", resume, { once: true, passive: true });
       document.addEventListener("click", resume, { once: true });
-    });
-  };
-
-  pc.onicecandidate = async (event) => {
-    if (event.candidate && currentCallId) {
-      await sendSignal("ice-candidate", event.candidate.toJSON());
     }
   };
 
-  pc.onconnectionstatechange = () => {
-    if (pc && (pc.connectionState === "failed" || pc.connectionState === "closed")) {
-      endCall(false);
+  thisPc.onicecandidate = async (event) => {
+    if (!event.candidate || thisPc !== pc || currentCallId !== callIdAtCreation) return;
+    try {
+      await sendSignal("ice-candidate", event.candidate.toJSON(), callIdAtCreation);
+    } catch {
+      // A transient signaling failure should not kill an otherwise healthy call.
     }
   };
+
+  thisPc.oniceconnectionstatechange = () => {
+    if (thisPc !== pc || currentCallId !== callIdAtCreation) return;
+    const state = thisPc.iceConnectionState;
+    if (state === "connected" || state === "completed") {
+      clearTimeout(disconnectGraceTimer);
+      clearTimeout(failedTimer);
+    } else if (state === "disconnected") {
+      clearTimeout(disconnectGraceTimer);
+      disconnectGraceTimer = setTimeout(() => {
+        if (thisPc === pc && currentCallId === callIdAtCreation &&
+            (thisPc.iceConnectionState === "disconnected" || thisPc.iceConnectionState === "failed")) {
+          toast("اتصال تماس قطع شد.");
+          endCall(false, callIdAtCreation);
+        }
+      }, 10000);
+    } else if (state === "failed") {
+      clearTimeout(failedTimer);
+      failedTimer = setTimeout(() => {
+        if (thisPc === pc && currentCallId === callIdAtCreation && thisPc.iceConnectionState === "failed") {
+          toast("اتصال تماس برقرار نشد.");
+          endCall(false, callIdAtCreation);
+        }
+      }, 2500);
+    }
+  };
+
+  thisPc.onconnectionstatechange = () => {
+    if (thisPc !== pc || currentCallId !== callIdAtCreation || generationAtCreation !== callGeneration) return;
+    const state = thisPc.connectionState;
+    if (state === "connected") {
+      clearTimeout(disconnectGraceTimer);
+      clearTimeout(failedTimer);
+      callState = "connected";
+      stopRingtone();
+    } else if (state === "connecting") {
+      callState = "connecting";
+    } else if (state === "disconnected") {
+      clearTimeout(disconnectGraceTimer);
+      disconnectGraceTimer = setTimeout(() => {
+        if (thisPc === pc && currentCallId === callIdAtCreation && thisPc.connectionState === "disconnected") {
+          toast("اتصال تماس قطع شد.");
+          endCall(false, callIdAtCreation);
+        }
+      }, 10000);
+    } else if (state === "failed") {
+      clearTimeout(failedTimer);
+      failedTimer = setTimeout(() => {
+        if (thisPc === pc && currentCallId === callIdAtCreation && thisPc.connectionState === "failed") {
+          toast("اتصال تماس برقرار نشد.");
+          endCall(false, callIdAtCreation);
+        }
+      }, 2500);
+    } else if (state === "closed") {
+      if (currentCallId === callIdAtCreation && callState !== "ending" && callState !== "ended") {
+        endCall(false, callIdAtCreation);
+      }
+    }
+  };
+
+  // Keep a per-PC queue so ICE that arrives before remoteDescription is not lost.
+  thisPc.__candidateQueue = candidateQueue;
+  return thisPc;
 }
 
 async function createAndSendOffer() {
-  const offer = await pc.createOffer();
+  if (!pc || !currentCallId) return;
+  const callId = currentCallId;
+  const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+  if (!pc || currentCallId !== callId) return;
   await pc.setLocalDescription(offer);
-  await sendSignal("offer", offer);
+  if (currentCallId !== callId) return;
+  await sendSignal("offer", pc.localDescription?.toJSON?.() || pc.localDescription, callId);
 }
 
-async function sendSignal(signalType, payload) {
-  if (!currentCallId) return;
-  await sb.from("call_signals").insert({
-    call_id: currentCallId,
+async function sendSignal(signalType, payload, callId = currentCallId) {
+  if (!callId || callId !== currentCallId) return;
+  const { error } = await sb.from("call_signals").insert({
+    call_id: callId,
     sender_id: currentUser.id,
     signal_type: signalType,
     payload
   });
+  if (error) throw error;
 }
 
 function subscribeToCallSignals(callId) {
@@ -1624,6 +1733,7 @@ function subscribeToCallSignals(callId) {
     sb.removeChannel(callSignalsChannel);
     callSignalsChannel = null;
   }
+  resetCallSignalingState();
 
   callSignalsChannel = sb
     .channel(`call-signals-${callId}`)
@@ -1631,51 +1741,72 @@ function subscribeToCallSignals(callId) {
       "postgres_changes",
       { event: "INSERT", schema: "public", table: "call_signals", filter: `call_id=eq.${callId}` },
       async (payload) => {
-        await handleIncomingSignal(payload.new);
+        if (currentCallId !== callId) return;
+        try { await handleIncomingSignal(payload.new); } catch (err) {
+          console.warn("Call signaling error", err);
+        }
       }
     )
     .subscribe(async (status) => {
-      // Critical fix: postgres_changes only streams events from the moment
-      // subscribe() completes — it never replays past inserts. The caller's
-      // offer (and any ICE candidates sent while the callee was still
-      // ringing/deciding) would otherwise be silently missed, so audio/video
-      // never connects. Catch up by fetching any signals already in the
-      // table for this call as soon as the channel is live.
-      if (status === "SUBSCRIBED") {
+      if (status === "SUBSCRIBED" && currentCallId === callId) {
         const { data: backlog } = await sb
           .from("call_signals")
           .select("*")
           .eq("call_id", callId)
           .neq("sender_id", currentUser.id)
           .order("created_at", { ascending: true });
-
         for (const row of backlog || []) {
-          await handleIncomingSignal(row);
+          if (currentCallId !== callId) break;
+          try { await handleIncomingSignal(row); } catch (err) {
+            console.warn("Call backlog signal error", err);
+          }
         }
       }
     });
 }
 
+async function flushPendingIceCandidates() {
+  if (!pc || !pc.remoteDescription) return;
+  const queue = pendingIceCandidates.splice(0);
+  for (const candidate of queue) {
+    try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch (err) {
+      console.warn("ICE candidate error", err);
+    }
+  }
+}
+
 async function handleIncomingSignal(row) {
-  if (row.sender_id === currentUser.id) return; // ignore our own signal echo
-  if (!pc) return; // peer connection not ready yet — shouldn't happen, but guard
+  if (!row || row.sender_id === currentUser.id) return;
+  if (row.call_id !== currentCallId || !pc) return;
+  if (row.id && processedSignalIds.has(row.id)) return;
+  if (row.id) processedSignalIds.add(row.id);
 
   if (row.signal_type === "offer") {
-    await pc.setRemoteDescription(new RTCSessionDescription(row.payload));
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    await sendSignal("answer", answer);
+    if (pc.signalingState === "stable" || pc.signalingState === "have-remote-offer") {
+      await pc.setRemoteDescription(new RTCSessionDescription(row.payload));
+      await flushPendingIceCandidates();
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await sendSignal("answer", pc.localDescription?.toJSON?.() || pc.localDescription, row.call_id);
+      callState = "connecting";
+    }
   } else if (row.signal_type === "answer") {
     if (pc.signalingState === "have-local-offer") {
       await pc.setRemoteDescription(new RTCSessionDescription(row.payload));
+      await flushPendingIceCandidates();
+      stopRingtone();
+      callState = "connecting";
     }
-    stopRingtone();
   } else if (row.signal_type === "ice-candidate") {
-    try {
-      await pc.addIceCandidate(new RTCIceCandidate(row.payload));
-    } catch { /* benign if candidate arrives after close */ }
+    if (!pc.remoteDescription) {
+      pendingIceCandidates.push(row.payload);
+      return;
+    }
+    try { await pc.addIceCandidate(new RTCIceCandidate(row.payload)); } catch (err) {
+      console.warn("ICE candidate error", err);
+    }
   } else if (row.signal_type === "hangup") {
-    endCall(false);
+    await endCall(false, row.call_id);
   }
 }
 
@@ -1797,6 +1928,9 @@ $("acceptCallBtn").addEventListener("click", async () => {
 
   currentCallId = call.id;
   currentCallType = call.call_type;
+  callState = "ringing";
+  callGeneration++;
+  resetCallSignalingState();
   currentOtherUser = currentOtherUser || caller;
 
   await sb.from("calls").update({ status: "accepted" }).eq("id", call.id);
@@ -1815,37 +1949,62 @@ $("rejectCallBtn").addEventListener("click", async () => {
 
 $("hangUpBtn").addEventListener("click", () => endCall(true));
 
-async function endCall(notifyPeer) {
-  stopRingtone();
-  clearTimeout(ringTimeoutId);
-  if (notifyPeer && currentCallId) {
-    await sendSignal("hangup", {});
-    await sb.from("calls").update({ status: "ended", ended_at: new Date().toISOString() }).eq("id", currentCallId);
+let callEndingInProgress = false;
+
+async function endCall(notifyPeer, callIdGuard = null) {
+  // Guard against stale/duplicate triggers (a late "failed" event, a hangup
+  // signal that arrives after the user already hung up manually, etc.)
+  // acting on a call that has already ended or been replaced by a new one —
+  // this was the cause of a new call being silently killed by a leftover
+  // event from the previous one, and of "still thinks I'm in a call" state.
+  if (callIdGuard && callIdGuard !== currentCallId) return;
+  if (!currentCallId && !pc && !localStream) return; // already fully ended
+  if (callEndingInProgress) return;
+  callEndingInProgress = true;
+  const endingCallId = currentCallId;
+  callState = "ending";
+  callGeneration++;
+
+  try {
+    stopRingtone();
+    clearTimeout(ringTimeoutId);
+
+    if (notifyPeer && currentCallId) {
+      try {
+        await sendSignal("hangup", {}, endingCallId);
+        await sb.from("calls").update({ status: "ended", ended_at: new Date().toISOString() }).eq("id", endingCallId);
+      } catch { /* best-effort — don't let a failed status update block cleanup */ }
+    }
+
+    if (callSignalsChannel) {
+      sb.removeChannel(callSignalsChannel);
+      callSignalsChannel = null;
+    }
+
+    if (callStatusChannel) {
+      sb.removeChannel(callStatusChannel);
+      callStatusChannel = null;
+    }
+
+    if (pc) {
+      pc.close();
+      pc = null;
+    }
+
+    stopLocalStream();
+    if (remoteStream) remoteStream.getTracks().forEach(track => track.stop());
+    remoteStream = null;
+    resetCallSignalingState();
+    currentCallId = null;
+    currentCallType = null;
+    isMuted = false;
+    isCameraOff = false;
+
+    closeCallModal();
+    callState = "ended";
+  } finally {
+    callEndingInProgress = false;
   }
-
-  if (callSignalsChannel) {
-    sb.removeChannel(callSignalsChannel);
-    callSignalsChannel = null;
-  }
-
-  if (callStatusChannel) {
-    sb.removeChannel(callStatusChannel);
-    callStatusChannel = null;
-  }
-
-  if (pc) {
-    pc.close();
-    pc = null;
-  }
-
-  stopLocalStream();
-  remoteStream = null;
-  currentCallId = null;
-  currentCallType = null;
-  isMuted = false;
-  isCameraOff = false;
-
-  closeCallModal();
 }
 
 function stopLocalStream() {
