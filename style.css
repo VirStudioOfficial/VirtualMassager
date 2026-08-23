@@ -757,35 +757,120 @@ html, body {
 .message-file .file-icon { font-size: 20px; }
 .message-file .file-name { font-size: 13px; word-break: break-all; }
 
-.message-actions {
-  display: none;
-  flex-wrap: wrap;
-  gap: 4px;
-  max-width: 220px;
-  position: absolute;
-  top: -14px;
-  left: 6px;
-  background: var(--panel3);
-  border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  padding: 2px;
-  box-shadow: var(--shadow-soft);
-  z-index: 5;
-  animation: pop .12s var(--ease-out);
+/* ============ Message context menu (right-click / long-press) ============ */
+/* Styled after Telegram-like messengers: a floating dark card, a quick
+   reaction strip on top, then a list of icon + label rows, with delete
+   actions set apart below a divider in the danger color. */
+
+.msg-context-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: transparent;
 }
 
-.message:hover .message-actions { display: flex; }
+.msg-context-menu {
+  position: absolute;
+  z-index: 201;
+  min-width: 210px;
+  max-width: 260px;
+  background: var(--panel3);
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  box-shadow: var(--shadow-soft);
+  padding: 8px;
+  animation: ctx-pop .14s var(--ease-out);
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+}
 
-.message-actions button {
-  padding: 4px 8px;
-  border-radius: 6px;
+@keyframes ctx-pop {
+  from { opacity: 0; transform: scale(.94) translateY(-4px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.msg-context-reactions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2px;
+  padding: 6px 4px 10px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.msg-context-reactions button {
+  flex: 1;
+  font-size: 19px;
+  line-height: 1;
+  padding: 5px 0;
+  border-radius: 10px;
+  transition: background .12s ease, transform .12s ease;
+}
+
+.msg-context-reactions button:hover {
+  background: var(--overlay-weak);
+  transform: scale(1.18);
+}
+
+.msg-context-reactions button.mine {
+  background: var(--overlay-weak);
+}
+
+.msg-context-items {
+  display: flex;
+  flex-direction: column;
+}
+
+.msg-context-menu button[data-ctx-action] {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 10px;
+  border-radius: 9px;
   color: var(--text);
-  font-size: 11px;
+  font-size: 13.5px;
+  text-align: right;
   transition: background .12s ease;
 }
 
-.message-actions button:hover { background: var(--overlay-weak); }
-.message-actions .delete { color: var(--danger); }
+.msg-context-menu button[data-ctx-action]:hover {
+  background: var(--overlay-weak);
+}
+
+.ctx-item-icon {
+  flex-shrink: 0;
+  width: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.ctx-item-label {
+  flex: 1;
+}
+
+.msg-context-divider {
+  height: 1px;
+  background: var(--border-soft);
+  margin: 6px 2px;
+}
+
+.msg-context-menu button.ctx-danger {
+  color: var(--danger);
+}
+
+.msg-context-menu button.ctx-danger .ctx-item-icon {
+  color: var(--danger);
+}
+
+.msg-context-menu button.ctx-danger:hover {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
 
 .reply-quote {
   background: var(--overlay-weak);
