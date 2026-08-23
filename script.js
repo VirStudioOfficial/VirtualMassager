@@ -975,8 +975,42 @@ function renderMessages(messages) {
 
   if (!messages.length) {
     box.innerHTML = `<div class="empty-state">اولین پیام رو بفرست 👋</div>`;
-  } else {
+    renderTypingIndicator();
+    return;
+  }
+
+  // Full rebuild only when the list was empty/placeholder, or the message
+  // count shrank (deletions/clear) — recomputing indices is cheap either way.
+  const existingEls = box.querySelectorAll(".message[data-message-id]");
+  const existingIds = Array.from(existingEls).map(el => el.dataset.messageId);
+  const newIds = messages.map(m => String(m.id));
+
+  const sameOrderPrefix = existingIds.length > 0 &&
+    existingIds.every((id, i) => id === newIds[i]);
+
+  if (!sameOrderPrefix) {
+    // Structure changed (first load, chat switch, delete, reorder) — full rebuild.
     box.innerHTML = messages.map(renderMessage).join("");
+    attachMessageActions();
+  } else {
+    // Same prefix: only update rows whose content actually changed, and
+    // append any new rows at the end. Avoids re-parsing/re-painting the
+    // whole message list (which was the main cause of visible lag/jank
+    // after every single message, edit, or reaction on longer chats).
+    existingEls.forEach((el, i) => {
+      const msg = messages[i];
+      if (!msg) return;
+      const newHtml = renderMessage(msg);
+      if (el.outerHTML !== newHtml) {
+        el.outerHTML = newHtml;
+      }
+    });
+
+    if (newIds.length > existingIds.length) {
+      const appendedHtml = messages.slice(existingIds.length).map(renderMessage).join("");
+      box.insertAdjacentHTML("beforeend", appendedHtml);
+    }
+
     attachMessageActions();
   }
 
@@ -991,27 +1025,6 @@ function renderMessage(message) {
   const pending = message.id.toString().startsWith("temp-");
   const selected = selectedMessageIds.has(message.id);
   const withinDeleteForEveryoneWindow = mine && (Date.now() - new Date(message.created_at).getTime()) <= 48 * 60 * 60 * 1000;
-
-  const actionButtons = [
-    `<button data-react="${message.id}" title="واکنش">😊</button>`,
-    `<button data-reply="${message.id}">پاسخ</button>`,
-    `<button data-forward="${message.id}">فوروارد</button>`
-  ];
-  if (message.content) {
-    actionButtons.push(`<button data-copy="${message.id}">کپی</button>`);
-  }
-  if (mine && !pending) {
-    if (!message.attachment_url) {
-      actionButtons.push(`<button data-edit="${message.id}">ویرایش</button>`);
-    }
-  }
-  if (!pending) {
-    actionButtons.push(`<button data-delete-for-me="${message.id}">حذف برای من</button>`);
-    if (withinDeleteForEveryoneWindow) {
-      actionButtons.push(`<button class="delete" data-delete="${message.id}">حذف برای همه</button>`);
-    }
-  }
-  const actions = pending ? "" : `<div class="message-actions">${actionButtons.join("")}</div>`;
 
   let mediaHtml = "";
   if (message.attachment_url) {
@@ -1072,7 +1085,14 @@ let replyHtml = "";
   const reactionHtml = reactionsForMessage.length ? renderReactionChips(message.id, reactionsForMessage) : "";
 
   return `
-    <div class="message ${mine ? "mine" : ""} ${pending ? "pending" : ""} ${selected ? "selected" : ""}" data-message-id="${message.id}">
+    <div class="message ${mine ? "mine" : ""} ${pending ? "pending" : ""} ${selected ? "selected" : ""}"
+         data-message-id="${message.id}"
+         data-ctx-menu="1"
+         data-ctx-mine="${mine ? "1" : "0"}"
+         data-ctx-pending="${pending ? "1" : "0"}"
+         data-ctx-has-content="${message.content ? "1" : "0"}"
+         data-ctx-has-attachment="${message.attachment_url ? "1" : "0"}"
+         data-ctx-can-delete-everyone="${withinDeleteForEveryoneWindow ? "1" : "0"}">
       ${checkboxHtml}
       ${forwardHtml}
       ${replyHtml}
@@ -1084,7 +1104,6 @@ let replyHtml = "";
         ${readTick}
       </div>
       ${reactionHtml}
-      ${actions}
     </div>
   `;
 }
@@ -1117,36 +1136,192 @@ function renderReactionChips(messageId, reactions) {
   return `<div class="reaction-row">${chips}</div>`;
 }
 
-// ---- Reactions ----
-function openReactionPicker(messageId, anchorEl) {
-  document.querySelector(".reaction-picker")?.remove();
+// ---- Message context menu (right-click / long-press) ----
+// Replaces the old always-visible hover action row with a proper context
+// menu: a quick-reaction strip above a dropdown of actions, matching the
+// reference messenger UI (reply / edit / copy image / copy text / pin /
+// download / forward / select / delete, with delete set apart in red).
+let activeContextMenuMessageId = null;
 
-  const picker = document.createElement("div");
-  picker.className = "reaction-picker";
-  picker.innerHTML = REACTION_EMOJIS.map(e => `<button data-pick-emoji="${e}">${e}</button>`).join("");
-  document.body.appendChild(picker);
-
-  const rect = anchorEl.getBoundingClientRect();
-  picker.style.top = `${rect.top + window.scrollY - 46}px`;
-  picker.style.left = `${rect.left + window.scrollX - 100}px`;
-
-  const closePicker = () => {
-    picker.remove();
-    document.removeEventListener("click", closePicker);
-  };
-
-  picker.addEventListener("click", async (e) => {
-    const emoji = e.target.dataset.pickEmoji;
-    if (!emoji) return;
-    closePicker();
-    await toggleReaction(messageId, emoji);
-  });
-
-  setTimeout(() => document.addEventListener("click", closePicker), 0);
+function closeMessageContextMenu() {
+  document.querySelector(".msg-context-menu")?.remove();
+  document.querySelector(".msg-context-backdrop")?.remove();
+  activeContextMenuMessageId = null;
+  document.removeEventListener("keydown", handleContextMenuEscape);
 }
 
+function handleContextMenuEscape(e) {
+  if (e.key === "Escape") closeMessageContextMenu();
+}
+
+function openMessageContextMenu(messageEl, clientX, clientY) {
+  closeMessageContextMenu();
+  document.querySelector(".reaction-picker")?.remove();
+
+  const messageId = messageEl.dataset.messageId;
+  const mine = messageEl.dataset.ctxMine === "1";
+  const pending = messageEl.dataset.ctxPending === "1";
+  if (pending) return; // nothing to do on an optimistic bubble that hasn't landed yet
+
+  const hasContent = messageEl.dataset.ctxHasContent === "1";
+  const hasAttachment = messageEl.dataset.ctxHasAttachment === "1";
+  const isImage = messageEl.querySelector(".message-image") !== null;
+  const canDeleteEveryone = messageEl.dataset.ctxCanDeleteEveryone === "1";
+  activeContextMenuMessageId = messageId;
+
+  const myReaction = (currentMessageReactions.get(messageId) || []).find(r => r.user_id === currentUser.id);
+
+  // Invisible backdrop so any outside click/tap closes the menu.
+  const backdrop = document.createElement("div");
+  backdrop.className = "msg-context-backdrop";
+  backdrop.addEventListener("click", closeMessageContextMenu);
+  backdrop.addEventListener("contextmenu", (e) => { e.preventDefault(); closeMessageContextMenu(); });
+  document.body.appendChild(backdrop);
+
+  const wrap = document.createElement("div");
+  wrap.className = "msg-context-menu";
+
+  const reactionStrip = `
+    <div class="msg-context-reactions">
+      ${REACTION_EMOJIS.map(e => `<button data-ctx-emoji="${e}" class="${myReaction?.emoji === e ? "mine" : ""}">${e}</button>`).join("")}
+    </div>
+  `;
+
+  const items = [];
+  items.push({ action: "reply", icon: "↩", label: "پاسخ" });
+  if (mine && !hasAttachment) items.push({ action: "edit", icon: "✎", label: "ویرایش" });
+  if (isImage) items.push({ action: "copy-image", icon: "🖼", label: "کپی تصویر" });
+  if (hasContent) items.push({ action: "copy", icon: "⧉", label: "کپی متن" });
+  items.push({ action: "pin", icon: "📌", label: "سنجاق کردن" });
+  if (hasAttachment) items.push({ action: "download", icon: "⭳", label: "دانلود" });
+  items.push({ action: "forward", icon: "➦", label: "بازارسال" });
+  items.push({ action: "select", icon: "✓", label: "انتخاب" });
+
+  const itemsHtml = items.map(it =>
+    `<button data-ctx-action="${it.action}"><span class="ctx-item-label">${it.label}</span><span class="ctx-item-icon">${it.icon}</span></button>`
+  ).join("");
+
+  const deleteHtml = `
+    <div class="msg-context-divider"></div>
+    <button data-ctx-action="delete-for-me" class="ctx-danger"><span class="ctx-item-label">حذف برای من</span><span class="ctx-item-icon">🗑</span></button>
+    ${canDeleteEveryone ? `<button data-ctx-action="delete-everyone" class="ctx-danger"><span class="ctx-item-label">حذف برای همه</span><span class="ctx-item-icon">🗑</span></button>` : ""}
+  `;
+
+  wrap.innerHTML = reactionStrip + `<div class="msg-context-items">${itemsHtml}</div>` + deleteHtml;
+  document.body.appendChild(wrap);
+
+  // Position within viewport bounds so it never renders off-screen.
+  const menuRect = wrap.getBoundingClientRect();
+  const margin = 8;
+  let left = clientX;
+  let top = clientY;
+  if (left + menuRect.width + margin > window.innerWidth) left = window.innerWidth - menuRect.width - margin;
+  if (left < margin) left = margin;
+  if (top + menuRect.height + margin > window.innerHeight) top = window.innerHeight - menuRect.height - margin;
+  if (top < margin) top = margin;
+  wrap.style.left = `${left + window.scrollX}px`;
+  wrap.style.top = `${top + window.scrollY}px`;
+
+  wrap.addEventListener("click", async (e) => {
+    e.stopPropagation();
+
+    const emojiBtn = e.target.closest("[data-ctx-emoji]");
+    if (emojiBtn) {
+      closeMessageContextMenu();
+      await toggleReaction(messageId, emojiBtn.dataset.ctxEmoji);
+      return;
+    }
+
+    const actionBtn = e.target.closest("[data-ctx-action]");
+    if (!actionBtn) return;
+    const action = actionBtn.dataset.ctxAction;
+    closeMessageContextMenu();
+
+    switch (action) {
+      case "reply":
+        startReply(messageId);
+        break;
+      case "edit": {
+        editingMessageId = messageId;
+        const message = findCachedMessage(messageId) || await getMessage(messageId);
+        if (!message) break;
+        $("editInput").value = message.content || "";
+        $("editModal").classList.remove("hidden");
+        $("editInput").focus();
+        break;
+      }
+      case "copy-image": {
+        const img = messageEl.querySelector(".message-image");
+        if (!img) break;
+        try {
+          const resp = await fetch(img.src);
+          const blob = await resp.blob();
+          await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+          toast("تصویر کپی شد.");
+        } catch {
+          toast("کپی تصویر ناموفق بود.");
+        }
+        break;
+      }
+      case "copy": {
+        const message = findCachedMessage(messageId);
+        if (!message?.content) break;
+        try {
+          await navigator.clipboard.writeText(message.content);
+          toast("پیام کپی شد.");
+        } catch {
+          toast("کپی ناموفق بود.");
+        }
+        break;
+      }
+      case "pin":
+        toast("سنجاق کردن پیام به‌زودی اضافه می‌شود.");
+        break;
+      case "download": {
+        const message = findCachedMessage(messageId);
+        if (!message?.attachment_url) break;
+        const a = document.createElement("a");
+        a.href = message.attachment_url;
+        a.download = message.attachment_name || "";
+        a.target = "_blank";
+        a.rel = "noopener";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        break;
+      }
+      case "forward":
+        openForwardPicker(messageId);
+        break;
+      case "select":
+        selectionMode = true;
+        selectedMessageIds.add(messageId);
+        renderMessages(currentMessagesCache);
+        break;
+      case "delete-for-me": {
+        const { error } = await sb
+          .from("message_hidden_for")
+          .upsert({ message_id: messageId, user_id: currentUser.id }, { onConflict: "message_id,user_id" });
+        if (error) { toast(error.message); break; }
+        currentMessagesCache = currentMessagesCache.filter(m => m.id !== messageId);
+        renderMessages(currentMessagesCache);
+        toast("پیام برای شما حذف شد.");
+        break;
+      }
+      case "delete-everyone": {
+        if (!confirm("این پیام برای هر دو نفر حذف بشه؟")) break;
+        const { error } = await sb.from("messages").delete().eq("id", messageId).eq("sender_id", currentUser.id);
+        if (error) toast(error.message);
+        break;
+      }
+    }
+  });
+
+  document.addEventListener("keydown", handleContextMenuEscape);
+}
+
+// ---- Reactions ----
 async function toggleReaction(messageId, emoji) {
-  const existing = (currentMessageReactions.get(messageId) || []).find(r => r.user_id === currentUser.id);
 
   if (existing && existing.emoji === emoji) {
     // Tapping the same emoji again removes it.
@@ -1200,141 +1375,103 @@ function subscribeToReactions() {
     .subscribe();
 }
 
+// Bound after every render (new elements only, via the __longPressBound
+// guard) — long-press on touch devices opens the same context menu that
+// right-click opens on desktop.
 function attachMessageActions() {
-  document.querySelectorAll("[data-edit]").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      editingMessageId = btn.dataset.edit;
-      const message = findCachedMessage(editingMessageId) || await getMessage(editingMessageId);
-      if (!message) return;
-      $("editInput").value = message.content || "";
-      $("editModal").classList.remove("hidden");
-      $("editInput").focus();
-    });
+  const box = $("messages");
+  box.querySelectorAll(".message[data-ctx-menu]").forEach(el => {
+    if (el.__longPressBound) return; // avoid re-binding on elements untouched by incremental render
+    el.__longPressBound = true;
+    let pressTimer = null;
+    let startX = 0, startY = 0;
+    const start = (e) => {
+      const point = e.touches ? e.touches[0] : e;
+      startX = point.clientX;
+      startY = point.clientY;
+      pressTimer = setTimeout(() => {
+        openMessageContextMenu(el, startX, startY);
+      }, 500);
+    };
+    const cancel = () => clearTimeout(pressTimer);
+    el.addEventListener("touchstart", start, { passive: true });
+    el.addEventListener("touchend", cancel);
+    el.addEventListener("touchmove", cancel);
+    el.addEventListener("touchcancel", cancel);
   });
+}
 
-  document.querySelectorAll("[data-delete]").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      if (!confirm("این پیام برای هر دو نفر حذف بشه؟")) return;
+// Bound once, ever, on init(). Handles every click inside the messages
+// list by inspecting event.target — works for elements that don't exist
+// yet at bind time, so incremental re-renders never need to re-wire clicks.
+// Also owns the right-click / long-press context menu trigger.
+function bindMessageActionsDelegation() {
+  const box = $("messages");
+  if (!box || box.__delegationBound) return;
+  box.__delegationBound = true;
 
-      const { error } = await sb
-        .from("messages")
-        .delete()
-        .eq("id", btn.dataset.delete)
-        .eq("sender_id", currentUser.id);
-
-      if (error) toast(error.message);
-    });
-  });
-
-  document.querySelectorAll("[data-delete-for-me]").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      const messageId = btn.dataset.deleteForMe;
-      const { error } = await sb
-        .from("message_hidden_for")
-        .upsert({ message_id: messageId, user_id: currentUser.id }, { onConflict: "message_id,user_id" });
-      if (error) return toast(error.message);
-
-      currentMessagesCache = currentMessagesCache.filter(m => m.id !== messageId);
-      renderMessages(currentMessagesCache);
-      toast("پیام برای شما حذف شد.");
-    });
-  });
-
-  document.querySelectorAll("[data-reply]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      startReply(btn.dataset.reply);
-    });
-  });
-
-  document.querySelectorAll("[data-react]").forEach(btn => {
-    btn.addEventListener("click", (e) => {
+  box.addEventListener("click", (e) => {
+    const reactionChipBtn = e.target.closest("[data-reaction-chip]");
+    if (reactionChipBtn) {
       e.stopPropagation();
-      openReactionPicker(btn.dataset.react, btn);
-    });
-  });
+      toggleReaction(reactionChipBtn.dataset.reactionChip, reactionChipBtn.dataset.emoji);
+      return;
+    }
 
-  document.querySelectorAll("[data-reaction-chip]").forEach(btn => {
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      toggleReaction(btn.dataset.reactionChip, btn.dataset.emoji);
-    });
-  });
-
-  document.querySelectorAll("[data-copy]").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      const message = findCachedMessage(btn.dataset.copy);
-      if (!message?.content) return;
-      try {
-        await navigator.clipboard.writeText(message.content);
-        toast("پیام کپی شد.");
-      } catch {
-        toast("کپی ناموفق بود.");
-      }
-    });
-  });
-
-  document.querySelectorAll("[data-forward]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      openForwardPicker(btn.dataset.forward);
-    });
-  });
-
-  document.querySelectorAll("[data-jump-to]").forEach(el => {
-    el.addEventListener("click", () => {
-      const target = document.querySelector(`[data-message-id="${el.dataset.jumpTo}"]`);
+    const jumpEl = e.target.closest("[data-jump-to]");
+    if (jumpEl) {
+      const target = document.querySelector(`[data-message-id="${jumpEl.dataset.jumpTo}"]`);
       if (target) {
         target.scrollIntoView({ behavior: "smooth", block: "center" });
         target.classList.add("flash-highlight");
         setTimeout(() => target.classList.remove("flash-highlight"), 900);
       }
-    });
-  });
+      return;
+    }
 
-  document.querySelectorAll("[data-select-checkbox]").forEach(cb => {
-    cb.addEventListener("change", () => {
-      const id = cb.dataset.selectCheckbox;
-      if (cb.checked) selectedMessageIds.add(id);
-      else selectedMessageIds.delete(id);
-      updateSelectionBar();
-    });
-  });
-
-  document.querySelectorAll("[data-view-image]").forEach(img => {
-    img.addEventListener("click", () => {
-      $("imageViewerImg").src = img.dataset.viewImage;
+    const viewImg = e.target.closest("[data-view-image]");
+    if (viewImg) {
+      $("imageViewerImg").src = viewImg.dataset.viewImage;
       $("imageViewerImg").classList.remove("hidden");
       $("imageViewerVideo").classList.add("hidden");
       $("imageViewerVideo").pause();
       $("imageViewer").classList.remove("hidden");
-    });
-  });
+      return;
+    }
 
-  document.querySelectorAll("[data-view-video]").forEach(wrap => {
-    wrap.addEventListener("click", () => {
-      $("imageViewerVideo").src = wrap.dataset.viewVideo;
+    const viewVideoWrap = e.target.closest("[data-view-video]");
+    if (viewVideoWrap) {
+      $("imageViewerVideo").src = viewVideoWrap.dataset.viewVideo;
       $("imageViewerVideo").classList.remove("hidden");
       $("imageViewerImg").classList.add("hidden");
       $("imageViewer").classList.remove("hidden");
       $("imageViewerVideo").play().catch(() => {});
-    });
+      return;
+    }
   });
 
-  // Long-press / long-click on a message enters selection mode (mobile-friendly multi-select).
-  document.querySelectorAll(".message").forEach(el => {
-    let pressTimer = null;
-    const start = () => {
-      pressTimer = setTimeout(() => {
-        selectionMode = true;
-        selectedMessageIds.add(el.dataset.messageId);
-        renderMessages(currentMessagesCache);
-      }, 500);
-    };
-    const cancel = () => clearTimeout(pressTimer);
-    el.addEventListener("mousedown", start);
-    el.addEventListener("touchstart", start, { passive: true });
-    ["mouseup", "mouseleave", "touchend", "touchmove"].forEach(evt => el.addEventListener(evt, cancel));
+  box.addEventListener("change", (e) => {
+    const cb = e.target.closest("[data-select-checkbox]");
+    if (!cb) return;
+    const id = cb.dataset.selectCheckbox;
+    if (cb.checked) selectedMessageIds.add(id);
+    else selectedMessageIds.delete(id);
+    updateSelectionBar();
+  });
+
+  // Desktop: right-click on a message opens the context menu.
+  box.addEventListener("contextmenu", (e) => {
+    const messageEl = e.target.closest(".message[data-ctx-menu]");
+    if (!messageEl) return;
+    if (e.target.closest("a, .message-select")) return; // let links / checkbox keep native behavior
+    e.preventDefault();
+    openMessageContextMenu(messageEl, e.clientX, e.clientY);
   });
 }
+
+// Mobile / touch: long-press on a message opens the same context menu
+// (instead of the old long-press-to-select behavior). Bound once per
+// message element via attachMessageActions below.
 
 // ---- Reply ----
 function startReply(messageId) {
@@ -2635,4 +2772,5 @@ $("toggleCamBtn").addEventListener("click", () => {
 });
 
 // Start.
+bindMessageActionsDelegation();
 init();
