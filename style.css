@@ -1368,3 +1368,65 @@ html, body {
   background: var(--overlay-weak);
   margin-bottom: 4px;
 }
+
+
+/* ===== Telegram Glass UI Upgrade ===== */
+body{
+  background:
+    radial-gradient(circle at top right, rgba(79,169,232,.14), transparent 35%),
+    radial-gradient(circle at bottom left, rgba(58,111,240,.12), transparent 35%),
+    var(--bg);
+}
+
+.app, .main, .sidebar, .chat-panel, .chat-window, .panel {
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+.sidebar, .chat-panel, .chat-window {
+  background: rgba(14,22,33,.72) !important;
+  border: 1px solid rgba(255,255,255,.08);
+  box-shadow: 0 25px 60px rgba(0,0,0,.35);
+}
+
+input, textarea, .search-box {
+  background: rgba(255,255,255,.06) !important;
+  border: 1px solid rgba(255,255,255,.09) !important;
+  border-radius: 18px !important;
+}
+
+.chat-item {
+  border-radius: 16px;
+  transition: .25s ease;
+}
+
+.chat-item:hover {
+  background: rgba(255,255,255,.06);
+  transform: translateX(-3px);
+}
+
+.message, .bubble {
+  border-radius: 18px !important;
+  animation: msgIn .25s ease;
+  box-shadow: 0 8px 25px rgba(0,0,0,.18);
+}
+
+@keyframes msgIn {
+ from {opacity:0; transform:translateY(8px) scale(.98)}
+ to {opacity:1; transform:none}
+}
+
+button {
+ transition: .2s ease;
+}
+
+button:hover {
+ transform: translateY(-2px);
+ filter: brightness(1.08);
+}
+
+.bottom-nav, .composer {
+ background: rgba(14,22,33,.75) !important;
+ backdrop-filter: blur(20px);
+ border-top: 1px solid rgba(255,255,255,.08);
+}
