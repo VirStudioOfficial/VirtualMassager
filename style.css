@@ -12,17 +12,17 @@
   --border-soft: #14202c;
   --text: #e6ecf2;
   --muted: #7c8a99;
-  --accent: #4fa9e8;
-  --accent2: #6cc0f7;
-  --mine: #3a6ff0;
-  --mine2: #2b5fd6;
+  --accent: #8b7bf0;
+  --accent2: #a595fb;
+  --mine: #7c5cf5;
+  --mine2: #6a45f0;
   --danger: #ec5e5e;
   --online: #4fd67a;
   --radius: 16px;
   --radius-sm: 11px;
   --shadow-soft: 0 20px 50px #00000066;
   --wallpaper-tint: #0e1621;
-  --tick-read: #7fd4ff;
+  --tick-read: #a595fb;
   --scrim: #000000a6;
   --overlay-weak: #ffffff10;
   --overlay-weak-2: #ffffff08;
@@ -40,15 +40,15 @@
   --border-soft: #e6eaee;
   --text: #17212b;
   --muted: #8b96a3;
-  --accent: #3390ec;
-  --accent2: #1c93e3;
-  --mine: #3390ec;
-  --mine2: #2b7fd6;
+  --accent: #7c5cf5;
+  --accent2: #6a45f0;
+  --mine: #7c5cf5;
+  --mine2: #6a45f0;
   --danger: #e35555;
   --online: #3ac267;
   --shadow-soft: 0 20px 50px #17212b26;
   --wallpaper-tint: #e4ecf3;
-  --tick-read: #3390ec;
+  --tick-read: #7c5cf5;
   --scrim: #17212b8a;
   --overlay-weak: #17212b12;
   --overlay-weak-2: #17212b08;
@@ -56,6 +56,7 @@
 
 html, body {
   height: 100%;
+  overflow: hidden;
 }
 
 body {
@@ -192,7 +193,8 @@ html, body {
 .app {
   height: 100vh;
   height: 100dvh;
-  max-height: 100dvh;
+  height: 100svh;
+  max-height: 100svh;
   display: grid;
   grid-template-columns: 360px 1fr;
   direction: ltr;
@@ -211,6 +213,7 @@ html, body {
   background: var(--panel);
   border-left: 1px solid var(--border);
   overflow: hidden;
+  min-height: 0;
   display: flex;
   flex-direction: column;
 }
@@ -454,17 +457,32 @@ html, body {
 /* ============ Chat panel ============ */
 .chat-panel {
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  position: relative;
   background-color: var(--wallpaper-tint);
-  background-image:
-    radial-gradient(circle at 8% 12%, rgba(79, 169, 232, 0.10) 0%, transparent 5%),
-    radial-gradient(circle at 22% 38%, rgba(79, 169, 232, 0.08) 0%, transparent 6%),
-    radial-gradient(circle at 62% 18%, rgba(79, 169, 232, 0.08) 0%, transparent 5%),
-    radial-gradient(circle at 78% 62%, rgba(79, 169, 232, 0.08) 0%, transparent 6%),
-    radial-gradient(circle at 35% 78%, rgba(79, 169, 232, 0.08) 0%, transparent 5%),
-    radial-gradient(circle at 92% 88%, rgba(79, 169, 232, 0.06) 0%, transparent 6%);
-  background-size: 180px 180px, 220px 220px, 260px 260px, 200px 200px, 240px 240px, 190px 190px;
+}
+
+.chat-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: .5;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220' viewBox='0 0 220 220'%3E%3Cg fill='%237c5cf5' fill-opacity='0.05'%3E%3Ctext x='14' y='34' font-size='26'%3E%F0%9F%92%AC%3C/text%3E%3Ctext x='120' y='20' font-size='20'%3E%E2%9D%A4%EF%B8%8F%3C/text%3E%3Ctext x='170' y='90' font-size='24'%3E%F0%9F%93%8E%3C/text%3E%3Ctext x='40' y='120' font-size='22'%3E%F0%9F%93%B7%3C/text%3E%3Ctext x='100' y='160' font-size='26'%3E%F0%9F%91%8D%3C/text%3E%3Ctext x='10' y='190' font-size='20'%3E%F0%9F%8E%A5%3C/text%3E%3Ctext x='150' y='195' font-size='22'%3E%F0%9F%98%8A%3C/text%3E%3C/g%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 220px 220px;
+}
+
+.chat-header, .messages, .reply-preview-container, .message-form, .attachment-preview {
+  position: relative;
+  z-index: 1;
+}
+
+[data-theme="light"] .chat-panel::before {
+  opacity: .35;
 }
 
 .chat-header-info { min-width: 0; flex: 1; cursor: pointer; }
@@ -473,6 +491,7 @@ html, body {
 
 .messages {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 16px 22px;
   display: flex;
@@ -525,15 +544,15 @@ html, body {
   align-self: flex-end;
   border-bottom-right-radius: var(--radius);
   border-bottom-left-radius: 4px;
-  background: rgba(79, 169, 232, 0.25);
-  border: 1px solid rgba(79, 169, 232, 0.35);
+  background: linear-gradient(135deg, var(--mine), var(--mine2));
+  border: 1px solid rgba(255, 255, 255, 0.08);
   color: #fff;
 }
 
 /* Light Theme tweaks for sent messages */
 [data-theme="light"] .message.mine {
-  background: rgba(51, 144, 236, 0.75);
-  border: 1px solid rgba(51, 144, 236, 0.4);
+  background: linear-gradient(135deg, var(--mine), var(--mine2));
+  border: 1px solid rgba(124, 92, 245, 0.4);
 }
 
 .message.pending { opacity: .65; }
