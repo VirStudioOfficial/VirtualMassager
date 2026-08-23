@@ -1084,21 +1084,6 @@ function renderMessage(message) {
     `;
   }
 
-// Shared short label for a message when it's referenced elsewhere (reply
-// quotes, reply-preview bar, sidebar last-message line) — covers every
-// attachment type so location/contact messages don't fall through to a
-// generic or misleading label.
-function messagePreviewLabel(message) {
-  if (message.content) return message.content;
-  switch (message.attachment_type) {
-    case "image": return "📷 عکس";
-    case "video": return "🎥 ویدیو";
-    case "location": return "📍 موقعیت مکانی";
-    case "contact": return "👤 مخاطب";
-    default: return "📎 فایل";
-  }
-}
-
 let replyHtml = "";
   if (message.reply_to_id) {
     const original = findCachedMessage(message.reply_to_id);
@@ -1152,6 +1137,21 @@ let replyHtml = "";
       ${actions}
     </div>
   `;
+}
+
+// Shared short label for a message when it's referenced elsewhere (reply
+// quotes, reply-preview bar, sidebar last-message line) — covers every
+// attachment type so location/contact messages don't fall through to a
+// generic or misleading label.
+function messagePreviewLabel(message) {
+  if (message.content) return message.content;
+  switch (message.attachment_type) {
+    case "image": return "📷 عکس";
+    case "video": return "🎥 ویدیو";
+    case "location": return "📍 موقعیت مکانی";
+    case "contact": return "👤 مخاطب";
+    default: return "📎 فایل";
+  }
 }
 
 // Groups reactions by emoji into small tappable chips, e.g. "👍 2" — highlighted
