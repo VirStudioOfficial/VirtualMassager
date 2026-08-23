@@ -63,7 +63,6 @@ let typingPingTimer = null;
 let typingStaleTimer = null;
 let isOtherTyping = false;
 let localSeq = 0;             // for temp ids on optimistic messages
-let pendingDestructSeconds = null; // self-destruct duration chosen for the next send, or null
 let reactionsChannel = null;
 let currentMessageReactions = new Map(); // messageId -> [{ user_id, emoji }]
 let showingArchived = false;  // toggles between normal chat list and archived list
@@ -232,7 +231,6 @@ function cleanupAllChannels() {
   if (incomingCallsChannel) { sb.removeChannel(incomingCallsChannel); incomingCallsChannel = null; }
   clearTimeout(typingPingTimer);
   clearTimeout(typingStaleTimer);
-  clearInterval(destructSweepTimer);
 }
 
 // ===============================
@@ -904,7 +902,7 @@ async function loadMessages() {
 
   let query = sb
     .from("messages")
-    .select("id, sender_id, content, attachment_url, attachment_type, attachment_name, created_at, edited_at, read_at, reply_to_id, forwarded_from_id, destroy_at, location_lat, location_lng, contact_name, contact_phone")
+    .select("id, sender_id, content, attachment_url, attachment_type, attachment_name, created_at, edited_at, read_at, reply_to_id, forwarded_from_id")
     .eq("chat_id", currentChatId)
     .order("created_at", { ascending: true })
     .limit(200);
@@ -924,18 +922,12 @@ async function loadMessages() {
     return;
   }
 
-  // Drop messages this user deleted "for me" locally, and any whose
-  // self-destruct timer has already passed (belt-and-suspenders alongside
-  // the periodic sweep — see sweepExpiredMessages()).
+  // Drop messages this user deleted "for me" locally.
   const hiddenIds = await getHiddenMessageIds((data || []).map(m => m.id));
-  const now = Date.now();
-  currentMessagesCache = (data || []).filter(m =>
-    !hiddenIds.has(m.id) && !(m.destroy_at && new Date(m.destroy_at).getTime() <= now)
-  );
+  currentMessagesCache = (data || []).filter(m => !hiddenIds.has(m.id));
 
   await loadReactionsForChat(currentChatId, chatIdAtCall);
   renderMessages(currentMessagesCache);
-  scheduleDestructSweep();
 }
 
 async function getHiddenMessageIds(messageIds) {
@@ -949,32 +941,6 @@ async function getHiddenMessageIds(messageIds) {
   return new Set((data || []).map(r => r.message_id));
 }
 
-// ---- Self-destruct sweep ----
-// There is no server-side cron in this project, so expiry is enforced by
-// whichever client happens to be open: on loading a chat, and every 5s while
-// one is open, expired messages get deleted from the DB (RLS allows either
-// member to delete once destroy_at has passed) and dropped from the view.
-// A message will not vanish if neither side has the chat open at expiry time
-// — it disappears the next time someone opens it instead of exactly on time.
-let destructSweepTimer = null;
-
-function scheduleDestructSweep() {
-  clearInterval(destructSweepTimer);
-  destructSweepTimer = setInterval(sweepExpiredMessages, 5000);
-}
-
-async function sweepExpiredMessages() {
-  if (!currentChatId) return;
-  const now = Date.now();
-  const expired = currentMessagesCache.filter(m => m.destroy_at && new Date(m.destroy_at).getTime() <= now);
-  if (!expired.length) return;
-
-  for (const m of expired) {
-    await sb.from("messages").delete().eq("id", m.id); // best-effort; realtime DELETE event will also confirm removal for the other side
-  }
-  currentMessagesCache = currentMessagesCache.filter(m => !expired.some(e => e.id === m.id));
-  renderMessages(currentMessagesCache);
-}
 
 async function loadReactionsForChat(chatId, chatIdAtCall) {
   const ids = currentMessagesCache.map(m => m.id).filter(id => !id.toString().startsWith("temp-"));
@@ -1066,22 +1032,6 @@ function renderMessage(message) {
         </a>
       `;
     }
-  } else if (message.attachment_type === "location" && message.location_lat != null) {
-    const mapUrl = `https://www.openstreetmap.org/?mlat=${message.location_lat}&mlon=${message.location_lng}#map=15/${message.location_lat}/${message.location_lng}`;
-    mediaHtml = `
-      <a class="message-location" href="${escapeHtml(mapUrl)}" target="_blank" rel="noopener">
-        <span class="file-icon">📍</span>
-        <span>مشاهده موقعیت روی نقشه</span>
-      </a>
-    `;
-  } else if (message.attachment_type === "contact") {
-    mediaHtml = `
-      <div class="message-contact">
-        <span class="file-icon">👤</span>
-        <span class="contact-name">${escapeHtml(message.contact_name || "")}</span>
-        <span class="contact-phone">${escapeHtml(message.contact_phone || "")}</span>
-      </div>
-    `;
   }
 
 let replyHtml = "";
@@ -1148,8 +1098,6 @@ function messagePreviewLabel(message) {
   switch (message.attachment_type) {
     case "image": return "📷 عکس";
     case "video": return "🎥 ویدیو";
-    case "location": return "📍 موقعیت مکانی";
-    case "contact": return "👤 مخاطب";
     default: return "📎 فایل";
   }
 }
@@ -1457,10 +1405,6 @@ async function forwardMessage(messageId, targetChatId) {
     attachment_url: original.attachment_url,
     attachment_type: original.attachment_type,
     attachment_name: original.attachment_name,
-    location_lat: original.location_lat ?? null,
-    location_lng: original.location_lng ?? null,
-    contact_name: original.contact_name ?? null,
-    contact_phone: original.contact_phone ?? null,
     forwarded_from_id: original.id
   });
 
@@ -1744,140 +1688,6 @@ function clearAttachment() {
   $("attachmentPreviewVideo").src = "";
 }
 
-// ---- Self-destruct timer ----
-$("destructTimerButton").addEventListener("click", (e) => {
-  e.stopPropagation();
-  openDestructTimerMenu($("destructTimerButton"));
-});
-
-function openDestructTimerMenu(anchorEl) {
-  document.querySelector(".destruct-timer-menu")?.remove();
-
-  const menu = document.createElement("div");
-  menu.className = "destruct-timer-menu";
-  const options = [
-    { key: null, label: "بدون تایمر" },
-    { key: 5, label: "۵ ثانیه" },
-    { key: 10, label: "۱۰ ثانیه" },
-    { key: 30, label: "۳۰ ثانیه" },
-    { key: 60, label: "۱ دقیقه" }
-  ];
-  menu.innerHTML = options.map(o =>
-    `<button data-seconds="${o.key ?? ""}" class="${pendingDestructSeconds === o.key ? "active" : ""}">${o.label}</button>`
-  ).join("");
-  document.body.appendChild(menu);
-
-  const rect = anchorEl.getBoundingClientRect();
-  menu.style.bottom = `${window.innerHeight - rect.top - window.scrollY + 6}px`;
-  menu.style.left = `${rect.left + window.scrollX - 60}px`;
-
-  const close = () => { menu.remove(); document.removeEventListener("click", close); };
-  menu.addEventListener("click", (e2) => {
-    const raw = e2.target.dataset.seconds;
-    if (raw === undefined) return;
-    pendingDestructSeconds = raw === "" ? null : Number(raw);
-    $("destructTimerButton").classList.toggle("active", pendingDestructSeconds !== null);
-    close();
-  });
-  setTimeout(() => document.addEventListener("click", close), 0);
-}
-
-// ---- Location & contact share ----
-$("shareExtrasButton").addEventListener("click", (e) => {
-  e.stopPropagation();
-  openShareExtrasMenu($("shareExtrasButton"));
-});
-
-function openShareExtrasMenu(anchorEl) {
-  document.querySelector(".share-extras-menu")?.remove();
-
-  const menu = document.createElement("div");
-  menu.className = "share-extras-menu";
-  menu.innerHTML = `
-    <button data-share="location">📍 اشتراک موقعیت</button>
-    <button data-share="contact">👤 اشتراک مخاطب</button>
-  `;
-  document.body.appendChild(menu);
-
-  const rect = anchorEl.getBoundingClientRect();
-  menu.style.bottom = `${window.innerHeight - rect.top - window.scrollY + 6}px`;
-  menu.style.left = `${rect.left + window.scrollX - 60}px`;
-
-  const close = () => { menu.remove(); document.removeEventListener("click", close); };
-  menu.addEventListener("click", async (e2) => {
-    const type = e2.target.dataset.share;
-    if (!type) return;
-    close();
-    if (type === "location") await shareLocation();
-    else if (type === "contact") openContactShareModal();
-  });
-  setTimeout(() => document.addEventListener("click", close), 0);
-}
-
-async function shareLocation() {
-  if (!navigator.geolocation) return toast("مرورگر شما از موقعیت مکانی پشتیبانی نمی‌کند.");
-  if (!currentChatId) return toast("اول یک گفتگو انتخاب کن.");
-
-  toast("در حال گرفتن موقعیت...");
-  navigator.geolocation.getCurrentPosition(
-    async (position) => {
-      const { latitude, longitude } = position.coords;
-      const { error } = await sb.from("messages").insert({
-        chat_id: currentChatId,
-        sender_id: currentUser.id,
-        attachment_type: "location",
-        location_lat: latitude,
-        location_lng: longitude,
-        destroy_at: destructAtFromPending()
-      });
-      if (error) toast(error.message);
-    },
-    () => toast("اجازه‌ی دسترسی به موقعیت داده نشد."),
-    { enableHighAccuracy: false, timeout: 10000 }
-  );
-}
-
-function openContactShareModal() {
-  $("contactShareName").value = "";
-  $("contactShareId").value = "";
-  $("contactShareModal").classList.remove("hidden");
-  $("contactShareName").focus();
-}
-
-$("cancelContactShare").addEventListener("click", () => {
-  $("contactShareModal").classList.add("hidden");
-});
-
-$("saveContactShare").addEventListener("click", async () => {
-  const name = $("contactShareName").value.trim();
-  const phone = $("contactShareId").value.trim();
-  if (!name || !phone) return toast("نام و شماره تلفن را وارد کن.");
-  if (!currentChatId) return toast("اول یک گفتگو انتخاب کن.");
-
-  const { error } = await sb.from("messages").insert({
-    chat_id: currentChatId,
-    sender_id: currentUser.id,
-    attachment_type: "contact",
-    contact_name: name,
-    contact_phone: phone,
-    destroy_at: destructAtFromPending()
-  });
-
-  if (error) return toast(error.message);
-  $("contactShareModal").classList.add("hidden");
-});
-
-// Converts the currently-picked self-destruct duration into an absolute
-// timestamp at send time, or null if no timer is set. Reset after each use
-// so the timer doesn't silently apply to unrelated later messages.
-function destructAtFromPending() {
-  if (!pendingDestructSeconds) return null;
-  const at = new Date(Date.now() + pendingDestructSeconds * 1000).toISOString();
-  pendingDestructSeconds = null;
-  $("destructTimerButton").classList.remove("active");
-  return at;
-}
-
 async function uploadAttachment(file) {
   const ext = file.name.includes(".") ? file.name.split(".").pop() : "bin";
   const path = `${currentUser.id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
@@ -1908,7 +1718,6 @@ $("messageForm").addEventListener("submit", async (e) => {
   sendingLock = true;
 
   const replyToId = replyingToMessageId;
-  const destroyAt = destructAtFromPending();
 
   input.value = "";
   clearAttachment();
@@ -1932,8 +1741,7 @@ $("messageForm").addEventListener("submit", async (e) => {
     edited_at: null,
     read_at: null,
     reply_to_id: replyToId || null,
-    forwarded_from_id: null,
-    destroy_at: destroyAt
+    forwarded_from_id: null
   };
 
   currentMessagesCache.push(optimisticMessage);
@@ -1961,8 +1769,7 @@ $("messageForm").addEventListener("submit", async (e) => {
         attachment_url,
         attachment_type,
         attachment_name,
-        reply_to_id: replyToId || null,
-        destroy_at: destroyAt
+        reply_to_id: replyToId || null
       });
 
     if (error) throw error;
@@ -1972,7 +1779,6 @@ $("messageForm").addEventListener("submit", async (e) => {
     const tempEl = box.querySelector(`[data-message-id="${tempId}"]`);
     if (tempEl) tempEl.remove();
     currentMessagesCache = currentMessagesCache.filter(m => m.id !== tempId);
-    scheduleDestructSweep();
   } catch (error) {
     toast(error.message || "ارسال پیام ناموفق بود.");
     const tempEl = box.querySelector(`[data-message-id="${tempId}"]`);
