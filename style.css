@@ -1687,3 +1687,56 @@ button,
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
 }
+
+
+/* ===== Avatar image + online indicator fix ===== */
+
+/* Force every avatar type (image and letter fallback) to share one frame */
+.avatar,
+.me-avatar,
+.chat-header-avatar {
+  position: relative;
+  overflow: visible;
+  isolation: isolate;
+}
+
+.avatar img,
+.me-avatar img,
+.chat-header-avatar img {
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: cover;
+  object-position: center;
+  display: block;
+  border-radius: 50%;
+  overflow: hidden;
+}
+
+/* actual circle clipping wrapper */
+.avatar:has(img),
+.me-avatar:has(img),
+.chat-header-avatar:has(img) {
+  overflow: hidden;
+}
+
+/* online dot should sit outside bottom corner */
+.online-dot,
+.status-dot,
+.avatar .online,
+.avatar .online-dot,
+.avatar .status-dot {
+  position: absolute;
+  right: -4px;
+  bottom: 2px;
+  left: auto;
+  top: auto;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--online);
+  border: 2px solid var(--panel);
+  box-shadow: 0 0 12px rgba(79,214,122,.65);
+  z-index: 5;
+}
