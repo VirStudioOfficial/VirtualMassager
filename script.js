@@ -2237,6 +2237,8 @@ function subscribeToCallStatus(callId) {
           endCall(false, callId);
         } else if (status === "accepted") {
           stopRingtone();
+          clearTimeout(ringTimeoutId);
+          ringTimeoutId = null;
           if (callState === "outgoing" || callState === "ringing") callState = "connecting";
         } else if (status === "ended") {
           endCall(false, callId);
@@ -2295,9 +2297,14 @@ async function startCall(callType) {
   await createAndSendOffer();
 
   // If nobody answers within 30s, mark the call missed and stop trying.
+  // Guard on callState too: once the callee accepts (or the call is already
+  // connecting/connected), this timer must not fire even if it wasn't
+  // cleared in time — otherwise a slow "accepted" Realtime event can hang
+  // up an already-answered call and falsely report "missed".
   clearTimeout(ringTimeoutId);
   ringTimeoutId = setTimeout(async () => {
-    if (currentCallId === call.id) {
+    if (currentCallId === call.id &&
+        (callState === "outgoing" || callState === "ringing")) {
       await sb.from("calls").update({ status: "missed", ended_at: new Date().toISOString() }).eq("id", call.id);
       toast("پاسخ داده نشد.");
       endCall(false, call.id);
