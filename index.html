@@ -15,7 +15,15 @@
 <body>
   <div id="toast"></div>
 
-  <section id="authView" class="auth-view">
+  <!-- تا وقتی جاوااسکریپت مشخص کند کاربر لاگین است یا نه، این صفحه‌ی خنثی
+       نشان داده می‌شود؛ نه فرم لاگین نه چت. بدون این، صفحه‌ی لاگین برای یک
+       لحظه (حین چک شدن session) دیده می‌شد حتی برای کاربری که از قبل وارد
+       شده بود، چون authView در HTML خام هیچ کلاس hidden نداشت. -->
+  <section id="initialLoading" class="initial-loading">
+    <div class="logo">💬</div>
+  </section>
+
+  <section id="authView" class="auth-view hidden">
     <div class="auth-card">
       <div class="logo">💬</div>
       <h1>Virtual Messenger</h1>
