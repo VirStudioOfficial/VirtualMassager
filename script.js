@@ -79,6 +79,7 @@ const MUTE_DURATIONS = {
 // ===============================
 const $ = (id) => document.getElementById(id);
 
+const initialLoading = $("initialLoading");
 const authView = $("authView");
 const appView = $("appView");
 const authForm = $("authForm");
@@ -237,8 +238,16 @@ function cleanupAllChannels() {
 // 5) Bootstrap
 // ===============================
 async function init() {
-  const { data } = await sb.auth.getSession();
-  await handleSession(data.session);
+  try {
+    const { data } = await sb.auth.getSession();
+    await handleSession(data.session);
+  } catch (err) {
+    // اگر خواندن session به هر دلیلی (شبکه، localStorage خراب و ...) شکست
+    // بخورد، نباید کاربر برای همیشه پشت صفحه‌ی initialLoading بماند —
+    // او را به فرم لاگین برمی‌گردانیم تا دوباره تلاش کند.
+    console.warn("getSession failed:", err);
+    await handleSession(null);
+  }
 
   sb.auth.onAuthStateChange(async (event, session) => {
     // TOKEN_REFRESHED / USER_UPDATED fire for the same signed-in user and
@@ -246,6 +255,11 @@ async function init() {
     // token refresh, duplicating realtime work). Only react to real
     // sign-in/sign-out transitions.
     if (event === "TOKEN_REFRESHED" && currentUser) return;
+    // INITIAL_SESSION fires immediately on subscribe with the same session
+    // we already handled two lines above via getSession() — without this
+    // guard, every page load ran loadChats()/ensureProfile() twice (visible
+    // in the network tab as duplicated get_chat_list / profiles requests).
+    if (event === "INITIAL_SESSION" && currentUser) return;
     await handleSession(session);
   });
 }
@@ -259,12 +273,14 @@ async function handleSession(session) {
     currentOtherUser = null;
     chatsCache = [];
     currentMessagesCache = [];
+    initialLoading?.classList.add("hidden");
     authView.classList.remove("hidden");
     appView.classList.add("hidden");
     return;
   }
 
   currentUser = session.user;
+  initialLoading?.classList.add("hidden");
   authView.classList.add("hidden");
   appView.classList.remove("hidden");
 
@@ -394,16 +410,22 @@ $("settingsBio").addEventListener("input", () => {
 
 $("uploadAvatarBtn").addEventListener("click", () => $("avatarInput").click());
 
-$("avatarInput").addEventListener("change", () => {
+$("avatarInput").addEventListener("change", async () => {
   const file = $("avatarInput").files[0];
   if (!file) return;
   if (!file.type.startsWith("image/")) {
     toast("فقط فایل تصویری مجاز است.");
     return;
   }
-  pendingAvatarFile = file;
+  // آواتار همیشه کوچک نمایش داده می‌شود ولی قبلاً بدون هیچ فشرده‌سازی آپلود
+  // می‌شد (مثلاً فایل خام دوربین گوشی، تا چند مگابایت) و همان فایل بزرگ هر
+  // بار در لیست چت‌ها/هدر دانلود می‌شد. اینجا قبل از پیش‌نمایش هم فشرده‌اش
+  // می‌کنیم (512px کافی است، حتی بزرگ‌تر از هر جایی که آواتار نمایش داده
+  // می‌شود) تا هم آپلود سریع‌تر شود و هم حجم دانلودش برای بقیه کم بماند.
+  const compressed = await compressImageFile(file, 512, 0.8);
+  pendingAvatarFile = compressed;
   avatarRemoved = false;
-  $("settingsAvatarPreview").innerHTML = `<img src="${URL.createObjectURL(file)}" alt="">`;
+  $("settingsAvatarPreview").innerHTML = `<img src="${URL.createObjectURL(compressed)}" alt="">`;
 });
 
 $("removeAvatarBtn").addEventListener("click", () => {
@@ -1630,13 +1652,12 @@ async function getMessage(id) {
 // تبدیل می‌کنیم تا هم آپلود سریع‌تر شود و هم حجم باکت Supabase کمتر مصرف شود.
 // GIF و SVG دست‌نخورده باقی می‌مانند چون فشرده‌سازی روی آن‌ها انیمیشن/کیفیت
 // وکتور را از بین می‌برد.
-async function compressImageFile(file) {
+async function compressImageFile(file, maxSide = 1920, quality = 0.84) {
   if (!file || !file.type.startsWith("image/")) return file;
   if (file.type === "image/gif" || file.type === "image/svg+xml") return file;
 
   try {
     const bitmap = await createImageBitmap(file);
-    const maxSide = 1920;
     const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
     const width = Math.max(1, Math.round(bitmap.width * scale));
     const height = Math.max(1, Math.round(bitmap.height * scale));
@@ -1650,7 +1671,7 @@ async function compressImageFile(file) {
     ctx.drawImage(bitmap, 0, 0, width, height);
     bitmap.close?.();
 
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", 0.84));
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", quality));
     // اگر خروجی فشرده‌شده بزرگ‌تر از فایل اصلی بود (مثلاً عکس از قبل کوچک/فشرده بوده)، اصل فایل را نگه دار.
     if (!blob || blob.size >= file.size) return file;
 
@@ -2347,7 +2368,15 @@ async function startCall(callType) {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       audio: true,
-      video: callType === "video"
+      // 720p/24fps: کیفیت خوب برای تماس تصویری با مصرف پهنای‌باند معقول.
+      // بدون این محدودیت، مرورگر ممکن است رزولوشن دوربین (حتی 1080p+) را
+      // بدون هیچ سقفی بفرستد که هم مصرف اینترنت را بی‌مورد بالا می‌برد
+      // (باعث لگ روی اینترنت‌های ضعیف‌تر می‌شود) و هم نیازی به آن نیست.
+      video: callType === "video" ? {
+        width: { ideal: 1280, max: 1280 },
+        height: { ideal: 720, max: 720 },
+        frameRate: { ideal: 24, max: 30 }
+      } : false
     });
   } catch (err) {
     toast("دسترسی به میکروفون/دوربین داده نشد.");
@@ -2451,14 +2480,20 @@ function updateCallMonitor(status, extra = {}) {
   });
 }
 
+let lastStatsSnapshot = null; // { bytesReceived, timestampMs } — برای محاسبه‌ی بیت‌ریت لحظه‌ای بین دو نمونه
+
 function startCallMonitor() {
   clearInterval(callStatsTimer);
+  lastStatsSnapshot = null;
   callStatsTimer = setInterval(async () => {
     if (!pc) return;
     try {
       const stats = await pc.getStats();
       let ping = null;
       let bitrate = null;
+      let totalBytesReceived = null;
+      let statsTimestampMs = null;
+
       stats.forEach(r => {
         if (
           r.type === "candidate-pair" &&
@@ -2468,16 +2503,32 @@ function startCallMonitor() {
           ping = Math.round(r.currentRoundTripTime * 1000);
         }
 
-        if (r.type === "inbound-rtp" && r.bytesReceived) {
-          bitrate = Math.round((r.bytesReceived * 8) / 1000);
+        // bytesReceived تجمعی است (از ابتدای تماس)، نه لحظه‌ای — پس اینجا
+        // فقط مقدار خام و timestamp را جمع می‌کنیم و بیت‌ریت واقعی را از
+        // تفاضل با نمونه‌ی قبلی محاسبه می‌کنیم (پایین‌تر).
+        if (r.type === "inbound-rtp" && r.kind === "video" && typeof r.bytesReceived === "number") {
+          totalBytesReceived = r.bytesReceived;
+          statsTimestampMs = r.timestamp;
         }
 
         if (r.type === "remote-inbound-rtp" && r.roundTripTime) {
           ping = Math.round(r.roundTripTime * 1000);
         }
       });
+
+      if (totalBytesReceived !== null && statsTimestampMs !== null) {
+        if (lastStatsSnapshot) {
+          const deltaBytes = totalBytesReceived - lastStatsSnapshot.bytesReceived;
+          const deltaMs = statsTimestampMs - lastStatsSnapshot.timestampMs;
+          if (deltaMs > 0 && deltaBytes >= 0) {
+            bitrate = Math.round((deltaBytes * 8) / deltaMs); // kbps: (bytes*8 bits)/(ms) = kbits/s
+          }
+        }
+        lastStatsSnapshot = { bytesReceived: totalBytesReceived, timestampMs: statsTimestampMs };
+      }
+
       if ($("callPing") && ping !== null) $("callPing").textContent = ping + " ms";
-      if ($("callQuality")) $("callQuality").textContent = bitrate ? bitrate + " kbps" : "فعال";
+      if ($("callQuality")) $("callQuality").textContent = bitrate !== null ? bitrate + " kbps" : "فعال";
     } catch {}
   }, 2000);
 }
@@ -2516,6 +2567,18 @@ async function createPeerConnection() {
 
   if (!localStream) throw new Error("Local media stream is missing");
   localStream.getTracks().forEach(track => thisPc.addTrack(track, localStream));
+
+  // سقف بیت‌ریت ارسالی برای ویدیو: یک محدودیت اطمینانی جدا از رزولوشن
+  // getUserMedia، چون بعضی مرورگرها حتی با رزولوشن محدود هم می‌توانند
+  // بیت‌ریت بالاتری انتخاب کنند. 1000 kbps برای 720p/24fps کیفیت خوبی
+  // می‌دهد بدون فشار زیاد روی اینترنت‌های ضعیف‌تر یا TURN relay.
+  thisPc.getSenders().forEach(sender => {
+    if (sender.track?.kind !== "video") return;
+    const params = sender.getParameters();
+    if (!params.encodings?.length) params.encodings = [{}];
+    params.encodings[0].maxBitrate = 1000000;
+    sender.setParameters(params).catch(() => {});
+  });
 
   remoteStream = new MediaStream();
   const remoteVideoEl = $("remoteVideo");
@@ -2839,7 +2902,11 @@ $("acceptCallBtn").addEventListener("click", async () => {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       audio: true,
-      video: call.call_type === "video"
+      video: call.call_type === "video" ? {
+        width: { ideal: 1280, max: 1280 },
+        height: { ideal: 720, max: 720 },
+        frameRate: { ideal: 24, max: 30 }
+      } : false
     });
   } catch {
     toast("دسترسی به میکروفون/دوربین داده نشد.");
@@ -2891,6 +2958,7 @@ async function endCall(notifyPeer, callIdGuard = null) {
     stopRingtone();
     clearTimeout(ringTimeoutId);
     clearInterval(callStatsTimer);
+    lastStatsSnapshot = null;
 
     if (notifyPeer && currentCallId) {
       try {
