@@ -1542,3 +1542,92 @@ html, body {
   color:var(--muted);
 }
 .call-monitor strong { color:var(--text); }
+
+/* ===== Virtual Messenger Glass Vision Redesign ===== */
+body {
+  background:
+    radial-gradient(circle at 15% 20%, rgba(124,92,245,.22), transparent 35%),
+    radial-gradient(circle at 85% 80%, rgba(0,210,255,.16), transparent 35%),
+    #070b14;
+}
+
+body::before {
+  content:"";
+  position:fixed;
+  inset:-20%;
+  pointer-events:none;
+  background:
+    radial-gradient(circle at 30% 30%, rgba(255,255,255,.10), transparent 8%),
+    radial-gradient(circle at 70% 20%, rgba(120,220,255,.12), transparent 10%),
+    radial-gradient(circle at 60% 75%, rgba(150,100,255,.12), transparent 12%);
+  filter: blur(45px);
+  animation: ambientFloat 14s ease-in-out infinite alternate;
+}
+
+@keyframes ambientFloat {
+  from { transform: translate3d(-2%,0,0) scale(1); }
+  to { transform: translate3d(2%,3%,0) scale(1.08); }
+}
+
+.auth-card,
+.sidebar,
+.chat-panel,
+.modal-card {
+  background: rgba(255,255,255,.07) !important;
+  border: 1px solid rgba(255,255,255,.14) !important;
+  backdrop-filter: blur(28px) saturate(140%);
+  -webkit-backdrop-filter: blur(28px) saturate(140%);
+  box-shadow: 0 30px 80px rgba(0,0,0,.35), inset 0 1px rgba(255,255,255,.12);
+}
+
+.app {
+  gap: 14px;
+  padding: 14px;
+}
+
+.sidebar,
+.chat-panel {
+  border-radius: 28px !important;
+  overflow:hidden;
+}
+
+.chat-header,
+.sidebar-header {
+  background: rgba(255,255,255,.05) !important;
+  border-color: rgba(255,255,255,.1) !important;
+}
+
+.message,
+.message-bubble {
+  border-radius: 22px !important;
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border: 1px solid rgba(255,255,255,.12);
+}
+
+.mine {
+  background: linear-gradient(135deg, rgba(124,92,245,.8), rgba(80,120,255,.55)) !important;
+  box-shadow: 0 12px 30px rgba(124,92,245,.25);
+}
+
+.icon-button,
+.send-button {
+  background: rgba(255,255,255,.08);
+  border:1px solid rgba(255,255,255,.12);
+  backdrop-filter: blur(12px);
+}
+
+.icon-button:hover,
+.send-button:hover {
+  transform: translateY(-2px);
+  background: rgba(255,255,255,.15);
+}
+
+.avatar {
+  box-shadow: 0 8px 25px rgba(0,0,0,.3), inset 0 1px rgba(255,255,255,.25);
+}
+
+@media(max-width:700px){
+ .app {padding:8px;}
+ .sidebar,.chat-panel {border-radius:22px !important;}
+}
