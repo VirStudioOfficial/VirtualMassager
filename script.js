@@ -2220,11 +2220,13 @@ window.addEventListener("beforeunload", () => {
 
 const RTC_CONFIG = {
   iceServers: [
-    { urls: "stun:stun.l.google.com:19302" }
-    // Add a TURN server here later for stricter NAT/firewall networks.
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" }
+    // برای اینترنت های سخت، TURN واقعی خودت را اینجا اضافه کن.
   ],
   bundlePolicy: "max-bundle",
-  rtcpMuxPolicy: "require"
+  rtcpMuxPolicy: "require",
+  iceCandidatePoolSize: 10
 };
 
 $("voiceCallButton").addEventListener("click", () => startCall("voice"));
@@ -2249,7 +2251,9 @@ function subscribeToCallStatus(callId) {
           endCall(false, callId);
         } else if (status === "accepted") {
           stopRingtone();
+      startCallMonitor();
           clearTimeout(ringTimeoutId);
+    clearInterval(callStatsTimer);
           ringTimeoutId = null;
           if (callState === "outgoing" || callState === "ringing") callState = "connecting";
         } else if (status === "ended") {
@@ -2314,6 +2318,7 @@ async function startCall(callType) {
   // cleared in time — otherwise a slow "accepted" Realtime event can hang
   // up an already-answered call and falsely report "missed".
   clearTimeout(ringTimeoutId);
+    clearInterval(callStatsTimer);
   ringTimeoutId = setTimeout(async () => {
     if (currentCallId === call.id &&
         (callState === "outgoing" || callState === "ringing")) {
@@ -2355,6 +2360,45 @@ function closeCallModal() {
   remoteEl.muted = false;
 }
 
+
+// ===============================
+// Call diagnostics monitor
+// ===============================
+let callStatsTimer = null;
+function updateCallMonitor(status, extra = {}) {
+  const map = {
+    connectionStatusText: status,
+    iceStatus: extra.ice ?? (pc?.iceConnectionState || "--"),
+    peerStatus: extra.peer ?? (pc?.connectionState || "--")
+  };
+  Object.entries(map).forEach(([id, value]) => {
+    const el = $(id);
+    if (el) el.textContent = value;
+  });
+}
+
+function startCallMonitor() {
+  clearInterval(callStatsTimer);
+  callStatsTimer = setInterval(async () => {
+    if (!pc) return;
+    try {
+      const stats = await pc.getStats();
+      let ping = null;
+      let bitrate = null;
+      stats.forEach(r => {
+        if (r.type === "candidate-pair" && r.currentRoundTripTime) {
+          ping = Math.round(r.currentRoundTripTime * 1000);
+        }
+        if (r.type === "inbound-rtp" && r.kind === "video" && r.bytesReceived) {
+          bitrate = Math.round((r.bytesReceived * 8) / 1000);
+        }
+      });
+      if ($("callPing") && ping !== null) $("callPing").textContent = ping + " ms";
+      if ($("callQuality")) $("callQuality").textContent = bitrate ? bitrate + " kbps" : "فعال";
+    } catch {}
+  }, 2000);
+}
+
 async function createPeerConnection() {
   const callIdAtCreation = currentCallId;
   const generationAtCreation = callGeneration;
@@ -2362,7 +2406,7 @@ async function createPeerConnection() {
   let disconnectGraceTimer = null;
   let failedTimer = null;
 
-  pc = new RTCPeerConnection(RTC_CONFIG);
+  pc = new RTCPeerConnection({...RTC_CONFIG, iceCandidatePoolSize: 10});
   const thisPc = pc;
 
   if (!localStream) throw new Error("Local media stream is missing");
@@ -2408,6 +2452,7 @@ async function createPeerConnection() {
   thisPc.oniceconnectionstatechange = () => {
     if (thisPc !== pc || currentCallId !== callIdAtCreation) return;
     const state = thisPc.iceConnectionState;
+    updateCallMonitor(callState, {ice: state, peer: thisPc.connectionState});
     if (state === "connected" || state === "completed") {
       clearTimeout(disconnectGraceTimer);
       clearTimeout(failedTimer);
@@ -2434,6 +2479,7 @@ async function createPeerConnection() {
   thisPc.onconnectionstatechange = () => {
     if (thisPc !== pc || currentCallId !== callIdAtCreation || generationAtCreation !== callGeneration) return;
     const state = thisPc.connectionState;
+    updateCallMonitor(state, {ice: thisPc.iceConnectionState, peer: state});
     if (state === "connected") {
       clearTimeout(disconnectGraceTimer);
       clearTimeout(failedTimer);
@@ -2695,11 +2741,12 @@ $("acceptCallBtn").addEventListener("click", async () => {
   resetCallSignalingState();
   currentOtherUser = currentOtherUser || caller;
 
-  await sb.from("calls").update({ status: "accepted" }).eq("id", call.id);
-
+  // اول سیگنالینگ را فعال کن تا offer از دست نرود.
   openCallModal(call.call_type);
   await createPeerConnection();
   subscribeToCallSignals(call.id);
+
+  await sb.from("calls").update({ status: "accepted" }).eq("id", call.id);
 });
 
 $("rejectCallBtn").addEventListener("click", async () => {
@@ -2730,6 +2777,7 @@ async function endCall(notifyPeer, callIdGuard = null) {
   try {
     stopRingtone();
     clearTimeout(ringTimeoutId);
+    clearInterval(callStatsTimer);
 
     if (notifyPeer && currentCallId) {
       try {
