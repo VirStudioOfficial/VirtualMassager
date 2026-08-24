@@ -1740,3 +1740,90 @@ button,
   box-shadow: 0 0 12px rgba(79,214,122,.65);
   z-index: 5;
 }
+
+
+/* ===== Glass sidebar + context menu polish v4 ===== */
+
+.sidebar {
+  margin: 10px;
+  border-radius: 24px;
+  background: rgba(18, 24, 45, .62);
+  border: 1px solid rgba(255,255,255,.08);
+  backdrop-filter: blur(24px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+  box-shadow: 0 20px 60px rgba(0,0,0,.25);
+}
+
+.sidebar-header {
+  background: rgba(255,255,255,.04);
+  border-bottom: 1px solid rgba(255,255,255,.08);
+  padding: 12px 16px;
+}
+
+.search-box input,
+.search-box {
+  background: rgba(255,255,255,.06);
+  border-color: rgba(255,255,255,.08);
+  backdrop-filter: blur(18px);
+}
+
+.chat-list {
+  padding: 8px;
+}
+
+.chat-item {
+  margin-bottom: 8px;
+  border-radius: 18px;
+  background: rgba(255,255,255,.035);
+  border: 1px solid rgba(255,255,255,.04);
+  transition: .2s ease;
+  overflow: hidden;
+}
+
+.chat-item:hover {
+  background: rgba(139,123,240,.12);
+  border-color: rgba(139,123,240,.28);
+  transform: translateX(-3px);
+}
+
+.chat-item.active {
+  background: linear-gradient(135deg, rgba(139,123,240,.28), rgba(100,80,200,.12));
+  border-color: rgba(165,149,251,.45);
+  box-shadow: inset 0 0 25px rgba(139,123,240,.12);
+}
+
+/* Floating context menu */
+.msg-context-menu {
+  background: rgba(20,28,48,.72);
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 22px;
+  box-shadow:
+    0 25px 70px rgba(0,0,0,.45),
+    inset 0 1px 0 rgba(255,255,255,.1);
+  backdrop-filter: blur(30px) saturate(180%);
+  -webkit-backdrop-filter: blur(30px) saturate(180%);
+  padding: 10px;
+}
+
+.msg-context-reactions {
+  background: rgba(255,255,255,.05);
+  border-radius: 14px;
+  border-bottom: none;
+  padding: 8px;
+}
+
+.msg-context-menu button[data-ctx-action] {
+  border-radius: 14px;
+  margin-top: 3px;
+  padding: 12px;
+}
+
+.msg-context-menu button[data-ctx-action]:hover {
+  background: rgba(139,123,240,.18);
+}
+
+.msg-context-menu button[data-ctx-action="delete"] {
+  color: #ff7777;
+  background: rgba(255,70,70,.08);
+}
+
