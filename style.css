@@ -1827,3 +1827,147 @@ button,
   background: rgba(255,70,70,.08);
 }
 
+
+
+/* ===== Glass call panel upgrade v5 ===== */
+
+.call-card,
+.incoming-call-card {
+  background: rgba(20, 28, 50, 0.62) !important;
+  border: 1px solid rgba(255,255,255,.12) !important;
+  border-radius: 26px !important;
+  backdrop-filter: blur(32px) saturate(170%);
+  -webkit-backdrop-filter: blur(32px) saturate(170%);
+  box-shadow:
+    0 30px 80px rgba(0,0,0,.45),
+    inset 0 1px 0 rgba(255,255,255,.12);
+}
+
+.call-videos {
+  background: rgba(0,0,0,.35) !important;
+  border: 1px solid rgba(255,255,255,.08);
+  backdrop-filter: blur(18px);
+}
+
+.call-actions button {
+  background: rgba(255,255,255,.08) !important;
+  border: 1px solid rgba(255,255,255,.12) !important;
+  border-radius: 50% !important;
+  backdrop-filter: blur(18px);
+  transition: .2s ease;
+}
+
+.call-actions button:hover {
+  background: rgba(139,123,240,.25) !important;
+  transform: translateY(-2px);
+}
+
+.incoming-call-card {
+  padding: 24px;
+}
+
+
+ /* ===== Final Glass polish: chat settings + context menu ===== */
+.settings-card,
+.modal-card {
+  background: rgba(20, 28, 48, .62);
+  border: 1px solid rgba(255,255,255,.10);
+  box-shadow: 0 24px 70px rgba(0,0,0,.45);
+  backdrop-filter: blur(28px) saturate(160%);
+  -webkit-backdrop-filter: blur(28px) saturate(160%);
+  border-radius: 24px;
+}
+
+.settings-card {
+  padding: 22px;
+}
+
+.settings-card .ghost-button,
+.settings-card button {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.msg-context-menu {
+  background: rgba(18, 27, 45, .68);
+  border: 1px solid rgba(255,255,255,.13);
+  box-shadow: 0 25px 80px rgba(0,0,0,.55);
+  border-radius: 22px;
+  padding: 10px;
+  backdrop-filter: blur(30px) saturate(170%);
+  -webkit-backdrop-filter: blur(30px) saturate(170%);
+}
+
+.msg-context-menu .ctx-item,
+.msg-context-menu button {
+  border-radius: 14px;
+  transition: .18s ease;
+}
+
+.msg-context-menu .ctx-item:hover,
+.msg-context-menu button:hover {
+  background: rgba(139,123,240,.18);
+}
+
+
+
+
+/* ===== Chat item options floating glass menu fix ===== */
+.chat-item-menu {
+  position: absolute;
+  min-width: 210px;
+  padding: 8px;
+  border-radius: 20px;
+  background: rgba(20, 30, 45, .72);
+  border: 1px solid rgba(255,255,255,.14);
+  box-shadow: 0 25px 70px rgba(0,0,0,.45);
+  backdrop-filter: blur(22px) saturate(150%);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
+  z-index: 9999;
+  overflow: hidden;
+  animation: glassMenuIn .18s var(--ease-out);
+}
+
+.chat-item-menu button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 38px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  color: var(--text);
+  background: transparent;
+  transition: background .15s ease, transform .15s ease;
+}
+
+.chat-item-menu button:hover {
+  background: rgba(255,255,255,.10);
+  transform: translateX(-2px);
+}
+
+.chat-item-menu button.danger-text {
+  color: #ff7d8a;
+}
+
+.chat-item-menu-divider {
+  height: 1px;
+  margin: 6px 8px;
+  background: rgba(255,255,255,.12);
+}
+
+@keyframes glassMenuIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Keep menu inside viewport */
+.chat-list,
+.chat-sidebar {
+  overflow: visible;
+}
