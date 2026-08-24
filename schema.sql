@@ -271,6 +271,8 @@ using (user_id = auth.uid());
 -- ===============================
 alter table public.messages replica identity full;
 alter table public.typing_status replica identity full;
+alter table public.calls replica identity full;
+alter table public.call_signals replica identity full;
 
 do $$
 begin
@@ -282,6 +284,20 @@ end $$;
 do $$
 begin
   alter publication supabase_realtime add table public.typing_status;
+exception
+  when duplicate_object then null;
+end $$;
+
+do $$
+begin
+  alter publication supabase_realtime add table public.calls;
+exception
+  when duplicate_object then null;
+end $$;
+
+do $$
+begin
+  alter publication supabase_realtime add table public.call_signals;
 exception
   when duplicate_object then null;
 end $$;
