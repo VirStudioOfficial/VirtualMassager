@@ -2347,15 +2347,7 @@ async function startCall(callType) {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       audio: true,
-      // 720p/24fps: کیفیت خوب برای تماس تصویری با مصرف پهنای‌باند معقول.
-      // بدون این محدودیت، مرورگر ممکن است رزولوشن دوربین (حتی 1080p+) را
-      // بدون هیچ سقفی بفرستد که هم مصرف اینترنت را بی‌مورد بالا می‌برد
-      // (باعث لگ روی اینترنت‌های ضعیف‌تر می‌شود) و هم نیازی به آن نیست.
-      video: callType === "video" ? {
-        width: { ideal: 1280, max: 1280 },
-        height: { ideal: 720, max: 720 },
-        frameRate: { ideal: 24, max: 30 }
-      } : false
+      video: callType === "video"
     });
   } catch (err) {
     toast("دسترسی به میکروفون/دوربین داده نشد.");
@@ -2459,20 +2451,14 @@ function updateCallMonitor(status, extra = {}) {
   });
 }
 
-let lastStatsSnapshot = null; // { bytesReceived, timestampMs } — برای محاسبه‌ی بیت‌ریت لحظه‌ای بین دو نمونه
-
 function startCallMonitor() {
   clearInterval(callStatsTimer);
-  lastStatsSnapshot = null;
   callStatsTimer = setInterval(async () => {
     if (!pc) return;
     try {
       const stats = await pc.getStats();
       let ping = null;
       let bitrate = null;
-      let totalBytesReceived = null;
-      let statsTimestampMs = null;
-
       stats.forEach(r => {
         if (
           r.type === "candidate-pair" &&
@@ -2482,32 +2468,16 @@ function startCallMonitor() {
           ping = Math.round(r.currentRoundTripTime * 1000);
         }
 
-        // bytesReceived تجمعی است (از ابتدای تماس)، نه لحظه‌ای — پس اینجا
-        // فقط مقدار خام و timestamp را جمع می‌کنیم و بیت‌ریت واقعی را از
-        // تفاضل با نمونه‌ی قبلی محاسبه می‌کنیم (پایین‌تر).
-        if (r.type === "inbound-rtp" && r.kind === "video" && typeof r.bytesReceived === "number") {
-          totalBytesReceived = r.bytesReceived;
-          statsTimestampMs = r.timestamp;
+        if (r.type === "inbound-rtp" && r.bytesReceived) {
+          bitrate = Math.round((r.bytesReceived * 8) / 1000);
         }
 
         if (r.type === "remote-inbound-rtp" && r.roundTripTime) {
           ping = Math.round(r.roundTripTime * 1000);
         }
       });
-
-      if (totalBytesReceived !== null && statsTimestampMs !== null) {
-        if (lastStatsSnapshot) {
-          const deltaBytes = totalBytesReceived - lastStatsSnapshot.bytesReceived;
-          const deltaMs = statsTimestampMs - lastStatsSnapshot.timestampMs;
-          if (deltaMs > 0 && deltaBytes >= 0) {
-            bitrate = Math.round((deltaBytes * 8) / deltaMs); // kbps: (bytes*8 bits)/(ms) = kbits/s
-          }
-        }
-        lastStatsSnapshot = { bytesReceived: totalBytesReceived, timestampMs: statsTimestampMs };
-      }
-
       if ($("callPing") && ping !== null) $("callPing").textContent = ping + " ms";
-      if ($("callQuality")) $("callQuality").textContent = bitrate !== null ? bitrate + " kbps" : "فعال";
+      if ($("callQuality")) $("callQuality").textContent = bitrate ? bitrate + " kbps" : "فعال";
     } catch {}
   }, 2000);
 }
@@ -2546,18 +2516,6 @@ async function createPeerConnection() {
 
   if (!localStream) throw new Error("Local media stream is missing");
   localStream.getTracks().forEach(track => thisPc.addTrack(track, localStream));
-
-  // سقف بیت‌ریت ارسالی برای ویدیو: یک محدودیت اطمینانی جدا از رزولوشن
-  // getUserMedia، چون بعضی مرورگرها حتی با رزولوشن محدود هم می‌توانند
-  // بیت‌ریت بالاتری انتخاب کنند. 1000 kbps برای 720p/24fps کیفیت خوبی
-  // می‌دهد بدون فشار زیاد روی اینترنت‌های ضعیف‌تر یا TURN relay.
-  thisPc.getSenders().forEach(sender => {
-    if (sender.track?.kind !== "video") return;
-    const params = sender.getParameters();
-    if (!params.encodings?.length) params.encodings = [{}];
-    params.encodings[0].maxBitrate = 1000000;
-    sender.setParameters(params).catch(() => {});
-  });
 
   remoteStream = new MediaStream();
   const remoteVideoEl = $("remoteVideo");
@@ -2881,11 +2839,7 @@ $("acceptCallBtn").addEventListener("click", async () => {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       audio: true,
-      video: call.call_type === "video" ? {
-        width: { ideal: 1280, max: 1280 },
-        height: { ideal: 720, max: 720 },
-        frameRate: { ideal: 24, max: 30 }
-      } : false
+      video: call.call_type === "video"
     });
   } catch {
     toast("دسترسی به میکروفون/دوربین داده نشد.");
@@ -2937,7 +2891,6 @@ async function endCall(notifyPeer, callIdGuard = null) {
     stopRingtone();
     clearTimeout(ringTimeoutId);
     clearInterval(callStatsTimer);
-    lastStatsSnapshot = null;
 
     if (notifyPeer && currentCallId) {
       try {
