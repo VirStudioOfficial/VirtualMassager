@@ -2325,10 +2325,9 @@ function subscribeToCallStatus(callId) {
           endCall(false, callId);
         } else if (status === "accepted") {
           stopRingtone();
-      startCallMonitor();
           clearTimeout(ringTimeoutId);
-    clearInterval(callStatsTimer);
           ringTimeoutId = null;
+          startCallMonitor();
           if (callState === "outgoing" || callState === "ringing") callState = "connecting";
         } else if (status === "ended") {
           endCall(false, callId);
@@ -2598,6 +2597,7 @@ async function createPeerConnection() {
       clearTimeout(failedTimer);
       callState = "connected";
       stopRingtone();
+      startCallMonitor();
     } else if (state === "connecting") {
       callState = "connecting";
     } else if (state === "disconnected") {
