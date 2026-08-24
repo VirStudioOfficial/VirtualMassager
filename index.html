@@ -6,9 +6,6 @@
   <title>Virtual Messenger</title>
   <link rel="stylesheet" href="style.css">
   <script>
-    // Apply the right theme before first paint so there's no flash of the
-    // wrong theme while the profile (which holds the saved preference)
-    // is still loading from Supabase.
     (function () {
       var prefersLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
       document.documentElement.setAttribute("data-theme", prefersLight ? "light" : "dark");
@@ -112,14 +109,19 @@
         <div class="modal-card call-card">
           <div class="call-header">
             <h3 id="callTitle">تماس صوتی / تصویری</h3>
+            <div id="callStatusBadge" class="call-status-badge hidden">در حال اتصال...</div>
           </div>
           <div class="call-videos">
             <video id="remoteVideo" autoplay playsinline></video>
             <video id="localVideo" autoplay playsinline muted></video>
           </div>
           <div class="call-actions">
-            <button id="toggleMuteBtn" class="icon-button" type="button" title="قطع/وصل صدا">🎤</button>
-            <button id="toggleCamBtn" class="icon-button" type="button" title="قطع/وصل دوربین"> كامرا </button>
+            <button id="toggleMuteBtn" class="icon-button" type="button" title="قطع/وصل صدا">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+            </button>
+            <button id="toggleCamBtn" class="icon-button" type="button" title="قطع/وصل دوربین">
+               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            </button>
             <button id="hangUpBtn" class="ghost-button danger-text" type="button">قطع تماس</button>
           </div>
         </div>
