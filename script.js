@@ -891,30 +891,27 @@ async function loadMessages() {
 
   // Fetch this member's own clear-point for the chat, so cleared history
   // stays hidden on this device without affecting the other member.
-  const { data: memberRow } = await sb
+  // Run this alongside the initial (unfiltered) messages fetch instead of
+  // awaiting it first — it only trims the result client-side below, so
+  // there's no need to block the messages round-trip on it. This was the
+  // main cause of chat-switching feeling slow: up to 4 Supabase requests
+  // were firing one after another instead of overlapping.
+  const memberRowPromise = sb
     .from("chat_members")
     .select("cleared_at")
     .eq("chat_id", currentChatId)
     .eq("user_id", currentUser.id)
     .single();
 
-  if (currentChatId !== chatIdAtCall) return;
-
-  let query = sb
+  const messagesPromise = sb
     .from("messages")
     .select("id, sender_id, content, attachment_url, attachment_type, attachment_name, created_at, edited_at, read_at, reply_to_id, forwarded_from_id")
     .eq("chat_id", currentChatId)
     .order("created_at", { ascending: true })
     .limit(200);
 
-  if (memberRow?.cleared_at) {
-    query = query.gt("created_at", memberRow.cleared_at);
-  }
+  const [{ data: memberRow }, { data, error }] = await Promise.all([memberRowPromise, messagesPromise]);
 
-  const { data, error } = await query;
-
-  // The user may have switched chats while this request was in flight —
-  // discard the stale result instead of overwriting the newer chat's messages.
   if (currentChatId !== chatIdAtCall) return;
 
   if (error) {
@@ -922,11 +919,25 @@ async function loadMessages() {
     return;
   }
 
-  // Drop messages this user deleted "for me" locally.
-  const hiddenIds = await getHiddenMessageIds((data || []).map(m => m.id));
-  currentMessagesCache = (data || []).filter(m => !hiddenIds.has(m.id));
+  let rows = data || [];
+  if (memberRow?.cleared_at) {
+    rows = rows.filter(m => m.created_at > memberRow.cleared_at);
+  }
 
-  await loadReactionsForChat(currentChatId, chatIdAtCall);
+  // Hidden-message lookup and reactions both only need message IDs, so run
+  // them together instead of one after the other.
+  const [hiddenIds] = await Promise.all([
+    getHiddenMessageIds(rows.map(m => m.id)),
+    loadReactionsForChat(currentChatId, chatIdAtCall, rows)
+  ]);
+
+  // The user may have switched chats while these requests were in flight —
+  // discard the stale result instead of overwriting the newer chat's messages.
+  if (currentChatId !== chatIdAtCall) return;
+
+  // Drop messages this user deleted "for me" locally.
+  currentMessagesCache = rows.filter(m => !hiddenIds.has(m.id));
+
   renderMessages(currentMessagesCache);
 }
 
@@ -942,10 +953,10 @@ async function getHiddenMessageIds(messageIds) {
 }
 
 
-async function loadReactionsForChat(chatId, chatIdAtCall) {
-  const ids = currentMessagesCache.map(m => m.id).filter(id => !id.toString().startsWith("temp-"));
-  currentMessageReactions = new Map();
-  if (!ids.length) return;
+async function loadReactionsForChat(chatId, chatIdAtCall, messages) {
+  const ids = (messages || currentMessagesCache).map(m => m.id).filter(id => !id.toString().startsWith("temp-"));
+  const reactionsMap = new Map();
+  if (!ids.length) { currentMessageReactions = reactionsMap; return; }
 
   const { data, error } = await sb
     .from("message_reactions")
@@ -956,9 +967,10 @@ async function loadReactionsForChat(chatId, chatIdAtCall) {
   if (error) return; // reactions are non-critical — fail silently, message list still renders
 
   for (const row of data || []) {
-    if (!currentMessageReactions.has(row.message_id)) currentMessageReactions.set(row.message_id, []);
-    currentMessageReactions.get(row.message_id).push(row);
+    if (!reactionsMap.has(row.message_id)) reactionsMap.set(row.message_id, []);
+    reactionsMap.get(row.message_id).push(row);
   }
+  currentMessageReactions = reactionsMap;
 }
 
 function findCachedMessage(id) {
