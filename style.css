@@ -1504,3 +1504,18 @@ html, body {
   background: var(--overlay-weak);
   margin-bottom: 4px;
 }
+
+.call-monitor {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  padding:10px 14px;
+  margin:10px auto;
+  width:95%;
+  background:var(--panel2);
+  border:1px solid var(--border-soft);
+  border-radius:14px;
+  font-size:12px;
+  color:var(--muted);
+}
+.call-monitor strong { color:var(--text); }
