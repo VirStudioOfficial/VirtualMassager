@@ -1631,3 +1631,53 @@ body::before {
  .app {padding:8px;}
  .sidebar,.chat-panel {border-radius:22px !important;}
 }
+
+
+/* ===== Virtual Glass UI Polish v2 ===== */
+.avatar { position: relative; overflow: visible; }
+.me-avatar::after,
+.chat-header-avatar::after,
+.settings-avatar::after {
+  content: "";
+  position: absolute;
+  right: 1px;
+  bottom: 1px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #39f58a;
+  border: 2px solid rgba(15,22,33,.9);
+  box-shadow: 0 0 12px rgba(57,245,138,.75);
+}
+
+/* glass context menu */
+.msg-context-menu {
+  background: rgba(20, 29, 43, .72);
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 20px;
+  box-shadow: 0 25px 70px rgba(0,0,0,.45);
+}
+
+/* unify settings and modals with glass theme */
+.modal-card,
+.settings-card {
+  background: rgba(18, 27, 42, .72);
+  border: 1px solid rgba(255,255,255,.12);
+  backdrop-filter: blur(28px) saturate(150%);
+  -webkit-backdrop-filter: blur(28px) saturate(150%);
+}
+
+/* smoother chat bubbles */
+.message {
+  transition: transform .18s ease, box-shadow .18s ease;
+}
+.message:hover {
+  transform: translateY(-1px);
+}
+
+/* glass buttons */
+button,
+.ghost-button {
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
