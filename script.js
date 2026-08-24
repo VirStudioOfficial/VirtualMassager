@@ -1625,6 +1625,43 @@ async function getMessage(id) {
   return data;
 }
 
+// ---- Image compression / normalization ----
+// قبل از آپلود، عکس‌های بزرگ را روی سمت کاربر (کلاینت) کوچک و به فرمت WebP
+// تبدیل می‌کنیم تا هم آپلود سریع‌تر شود و هم حجم باکت Supabase کمتر مصرف شود.
+// GIF و SVG دست‌نخورده باقی می‌مانند چون فشرده‌سازی روی آن‌ها انیمیشن/کیفیت
+// وکتور را از بین می‌برد.
+async function compressImageFile(file) {
+  if (!file || !file.type.startsWith("image/")) return file;
+  if (file.type === "image/gif" || file.type === "image/svg+xml") return file;
+
+  try {
+    const bitmap = await createImageBitmap(file);
+    const maxSide = 1920;
+    const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+    const width = Math.max(1, Math.round(bitmap.width * scale));
+    const height = Math.max(1, Math.round(bitmap.height * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d", { alpha: false });
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(bitmap, 0, 0, width, height);
+    bitmap.close?.();
+
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", 0.84));
+    // اگر خروجی فشرده‌شده بزرگ‌تر از فایل اصلی بود (مثلاً عکس از قبل کوچک/فشرده بوده)، اصل فایل را نگه دار.
+    if (!blob || blob.size >= file.size) return file;
+
+    const base = file.name.replace(/\.[^.]+$/, "") || "image";
+    return new File([blob], `${base}.webp`, { type: "image/webp", lastModified: Date.now() });
+  } catch (err) {
+    console.warn("Image compression skipped:", err);
+    return file; // در صورت خطا، فایل اصلی بدون فشرده‌سازی ارسال می‌شود.
+  }
+}
+
 // ---- Attachment picking ----
 $("attachButton").addEventListener("click", () => $("fileInput").click());
 
@@ -1648,7 +1685,8 @@ $("fileInput").addEventListener("change", async () => {
     return;
   }
 
-  pendingAttachment = { file, kind };
+  const preparedFile = isImage ? await compressImageFile(file) : file;
+  pendingAttachment = { file: preparedFile, kind };
   showAttachmentPreview();
   $("messageInput").focus();
 });
@@ -2218,11 +2256,47 @@ window.addEventListener("beforeunload", () => {
 //   the "room" and add a call_participants table (one row per participant)
 //   without touching this signaling flow.
 
+// ===============================
+// TURN / STUN configuration
+// ===============================
+// چرا این بخش لازم است:
+// وقتی هر دو نفر روی یک شبکه‌ی محلی (وای‌فای خانه/دفتر) باشند، اتصال مستقیم
+// (P2P) با کمک STUN به‌راحتی برقرار می‌شود. اما وقتی طرف مقابل روی یک شبکه‌ی
+// دیگر باشد (موبایل، اینترنت خانه‌ی دیگر و ...)، اغلب پشت یک NAT/فایروال
+// محدودکننده (Symmetric NAT) قرار دارد که اتصال مستقیم را اصلاً اجازه نمی‌دهد.
+// در آن حالت مرورگر مجبور است ترافیک صوت/تصویر را از یک سرور TURN رله کند.
+// بدون TURN، این‌جور تماس‌ها همیشه failed می‌شوند — دقیقاً همان مشکلی که
+// گزارش شده بود.
+//
+// اینجا از سرویس رایگان و بدون‌نیاز-به-ثبت‌نام OpenRelay استفاده شده تا همین
+// الان کار کند. برای استفاده‌ی جدی/تولیدی، توصیه می‌شود یک TURN اختصاصی
+// (مثل Twilio Network Traversal Service، Cloudflare Calls، Metered.ca یا
+// coturn خودتان روی سرور شخصی) جایگزین آن شود، چون سرویس رایگان معمولاً
+// محدودیت پهنای‌باند و تضمین در‌دسترس‌بودن ندارد.
 const RTC_CONFIG = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" }
-    // برای اینترنت های سخت، TURN واقعی خودت را اینجا اضافه کن.
+    { urls: "stun:stun1.l.google.com:19302" },
+    // TURN over UDP — سریع‌ترین حالت وقتی UDP باز باشد.
+    {
+      urls: "turn:openrelay.metered.ca:80",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    },
+    // TURN over TCP — برای شبکه‌هایی که UDP را می‌بندند (خیلی از شبکه‌های
+    // شرکتی/دانشگاهی/موبایل اپراتور).
+    {
+      urls: "turn:openrelay.metered.ca:443?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    },
+    // TURN روی پورت 443 با TLS — وقتی فایروال فقط ترافیک HTTPS-مانند را رد
+    // می‌کند (سخت‌گیرانه‌ترین حالت رایج).
+    {
+      urls: "turns:openrelay.metered.ca:443?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    }
   ],
   bundlePolicy: "max-bundle",
   rtcpMuxPolicy: "require",
@@ -2369,7 +2443,8 @@ function updateCallMonitor(status, extra = {}) {
   const map = {
     connectionStatusText: status,
     iceStatus: extra.ice ?? (pc?.iceConnectionState || "--"),
-    peerStatus: extra.peer ?? (pc?.connectionState || "--")
+    peerStatus: extra.peer ?? (pc?.connectionState || "--"),
+    signalStatus: pc ? pc.signalingState : "--" 
   };
   Object.entries(map).forEach(([id, value]) => {
     const el = $(id);
@@ -2386,11 +2461,20 @@ function startCallMonitor() {
       let ping = null;
       let bitrate = null;
       stats.forEach(r => {
-        if (r.type === "candidate-pair" && r.currentRoundTripTime) {
+        if (
+          r.type === "candidate-pair" &&
+          (r.state === "succeeded" || r.nominated) &&
+          r.currentRoundTripTime
+        ) {
           ping = Math.round(r.currentRoundTripTime * 1000);
         }
-        if (r.type === "inbound-rtp" && r.kind === "video" && r.bytesReceived) {
+
+        if (r.type === "inbound-rtp" && r.bytesReceived) {
           bitrate = Math.round((r.bytesReceived * 8) / 1000);
+        }
+
+        if (r.type === "remote-inbound-rtp" && r.roundTripTime) {
+          ping = Math.round(r.roundTripTime * 1000);
         }
       });
       if ($("callPing") && ping !== null) $("callPing").textContent = ping + " ms";
@@ -2405,6 +2489,28 @@ async function createPeerConnection() {
   const candidateQueue = [];
   let disconnectGraceTimer = null;
   let failedTimer = null;
+  let iceRestartAttempted = false;
+
+  // یک تلاش برای احیای اتصال قبل از قطع کامل تماس: وقتی مسیر شبکه به‌طور
+  // موقت عوض می‌شود (جابه‌جایی وای‌فای/موبایل‌دیتا) یا اولین‌بار TURN دیر
+  // فعال شود، ICE restart می‌تواند بدون قطع تماس دوباره وصل شود.
+  async function attemptIceRestart(thisPc, callIdAtCreation) {
+    if (iceRestartAttempted) return false;
+    if (thisPc !== pc || currentCallId !== callIdAtCreation) return false;
+    // فقط طرفی که offer را ساخته می‌تواند ICE restart را با یک offer جدید
+    // آغاز کند؛ signalingState پایدار بودن باید تضمین شود.
+    if (thisPc.signalingState !== "stable") return false;
+    iceRestartAttempted = true;
+    try {
+      const offer = await thisPc.createOffer({ iceRestart: true });
+      await thisPc.setLocalDescription(offer);
+      await sendSignal("offer", offer, callIdAtCreation);
+      return true;
+    } catch (err) {
+      console.warn("ICE restart failed:", err);
+      return false;
+    }
+  }
 
   pc = new RTCPeerConnection({...RTC_CONFIG, iceCandidatePoolSize: 10});
   const thisPc = pc;
@@ -2456,21 +2562,28 @@ async function createPeerConnection() {
     if (state === "connected" || state === "completed") {
       clearTimeout(disconnectGraceTimer);
       clearTimeout(failedTimer);
+      iceRestartAttempted = false; // اتصال سالم شد، اجازه بده دفعه‌ی بعد دوباره امکان restart باشد
     } else if (state === "disconnected") {
       clearTimeout(disconnectGraceTimer);
-      disconnectGraceTimer = setTimeout(() => {
+      disconnectGraceTimer = setTimeout(async () => {
         if (thisPc === pc && currentCallId === callIdAtCreation &&
             (thisPc.iceConnectionState === "disconnected" || thisPc.iceConnectionState === "failed")) {
-          toast("اتصال تماس قطع شد.");
-          endCall(false, callIdAtCreation);
+          const restarted = await attemptIceRestart(thisPc, callIdAtCreation);
+          if (!restarted) {
+            toast("اتصال تماس قطع شد.");
+            endCall(false, callIdAtCreation);
+          }
         }
       }, 10000);
     } else if (state === "failed") {
       clearTimeout(failedTimer);
-      failedTimer = setTimeout(() => {
+      failedTimer = setTimeout(async () => {
         if (thisPc === pc && currentCallId === callIdAtCreation && thisPc.iceConnectionState === "failed") {
-          toast("اتصال تماس برقرار نشد.");
-          endCall(false, callIdAtCreation);
+          const restarted = await attemptIceRestart(thisPc, callIdAtCreation);
+          if (!restarted) {
+            toast("اتصال تماس برقرار نشد.");
+            endCall(false, callIdAtCreation);
+          }
         }
       }, 2500);
     }
