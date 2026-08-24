@@ -111,6 +111,13 @@
             <h3 id="callTitle">تماس صوتی / تصویری</h3>
             <div id="callStatusBadge" class="call-status-badge hidden">در حال اتصال...</div>
           </div>
+          <div id="callMonitor" class="call-monitor">
+            <div>وضعیت: <strong id="connectionStatusText">در انتظار...</strong></div>
+            <div>Ping: <strong id="callPing">-- ms</strong></div>
+            <div>ICE: <strong id="iceStatus">--</strong></div>
+            <div>WebRTC: <strong id="peerStatus">--</strong></div>
+            <div>کیفیت: <strong id="callQuality">--</strong></div>
+          </div>
           <div class="call-videos">
             <video id="remoteVideo" autoplay playsinline></video>
             <video id="localVideo" autoplay playsinline muted></video>
