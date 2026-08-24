@@ -95,6 +95,29 @@ button:disabled { opacity: .5; cursor: default; }
     var(--bg);
 }
 
+/* صفحه‌ی خنثی قبل از این‌که مشخص شود کاربر لاگین است یا نه — همان پس‌زمینه‌ی
+   auth-view را دارد تا هیچ چشمک/پرشی حین رد شدن به appView یا authView حس نشود. */
+.initial-loading {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  background:
+    radial-gradient(circle at 18% 12%, color-mix(in srgb, var(--accent) 16%, transparent) 0%, transparent 42%),
+    radial-gradient(circle at 86% 88%, color-mix(in srgb, var(--mine) 14%, transparent) 0%, transparent 45%),
+    var(--bg);
+}
+
+.initial-loading .logo {
+  font-size: 48px;
+  animation: initial-loading-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes initial-loading-pulse {
+  0%, 100% { opacity: 0.55; transform: scale(0.96); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
 .auth-card {
   width: min(400px, 100%);
   background: var(--panel);
