@@ -2272,7 +2272,7 @@ window.addEventListener("beforeunload", () => {
 //   touches Supabase — it's peer-to-peer via WebRTC once connected.
 // - A public STUN server handles NAT traversal for most home/office networks.
 //   For networks behind strict NATs/firewalls a TURN server would be needed;
-//   swap RTC_CONFIG below to add one when available.
+//   TURN credentials are fetched fresh (see fetchIceServers) from Metered.ca.
 // - Designed for 1:1 calls today; a future group call can reuse `calls` as
 //   the "room" and add a call_participants table (one row per participant)
 //   without touching this signaling flow.
@@ -2286,43 +2286,42 @@ window.addEventListener("beforeunload", () => {
 // دیگر باشد (موبایل، اینترنت خانه‌ی دیگر و ...)، اغلب پشت یک NAT/فایروال
 // محدودکننده (Symmetric NAT) قرار دارد که اتصال مستقیم را اصلاً اجازه نمی‌دهد.
 // در آن حالت مرورگر مجبور است ترافیک صوت/تصویر را از یک سرور TURN رله کند.
-// بدون TURN، این‌جور تماس‌ها همیشه failed می‌شوند — دقیقاً همان مشکلی که
-// گزارش شده بود.
+// بدون TURN، این‌جور تماس‌ها همیشه failed می‌شوند.
 //
-// اینجا از سرویس رایگان و بدون‌نیاز-به-ثبت‌نام OpenRelay استفاده شده تا همین
-// الان کار کند. برای استفاده‌ی جدی/تولیدی، توصیه می‌شود یک TURN اختصاصی
-// (مثل Twilio Network Traversal Service، Cloudflare Calls، Metered.ca یا
-// coturn خودتان روی سرور شخصی) جایگزین آن شود، چون سرویس رایگان معمولاً
-// محدودیت پهنای‌باند و تضمین در‌دسترس‌بودن ندارد.
-const RTC_CONFIG = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    // TURN over UDP — سریع‌ترین حالت وقتی UDP باز باشد.
-    {
-      urls: "turn:openrelay.metered.ca:80",
-      username: "openrelayproject",
-      credential: "openrelayproject"
-    },
-    // TURN over TCP — برای شبکه‌هایی که UDP را می‌بندند (خیلی از شبکه‌های
-    // شرکتی/دانشگاهی/موبایل اپراتور).
-    {
-      urls: "turn:openrelay.metered.ca:443?transport=tcp",
-      username: "openrelayproject",
-      credential: "openrelayproject"
-    },
-    // TURN روی پورت 443 با TLS — وقتی فایروال فقط ترافیک HTTPS-مانند را رد
-    // می‌کند (سخت‌گیرانه‌ترین حالت رایج).
-    {
-      urls: "turns:openrelay.metered.ca:443?transport=tcp",
-      username: "openrelayproject",
-      credential: "openrelayproject"
+// نکته‌ی مهم: سرویس رایگان قدیمی openrelay.metered.ca با credential ثابت
+// (openrelayproject/openrelayproject) دیگر به‌طور قابل‌اعتماد کار نمی‌کند.
+// به‌جایش از حساب رسمی Metered.ca استفاده می‌کنیم که هر بار credential های
+// TURN را به‌صورت تازه و زمان‌دار از طریق API برمی‌گرداند.
+const METERED_TURN_API_URL =
+  "https://virtual-meetapi.metered.live/api/v1/turn/credentials?apiKey=30435bf87e2a72fe817e7a2ce990da71d002";
+
+// STUN عمومی به‌عنوان fallback؛ اگر fetch گرفتن credential های TURN به هر
+// دلیلی (قطعی اینترنت، از کار افتادن API و...) شکست بخورد، حداقل تماس‌های
+// داخل همون شبکه (که فقط به STUN نیاز دارند) همچنان کار می‌کنند.
+const FALLBACK_STUN_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+];
+
+/**
+ * دریافت لیست تازه‌ی iceServers (STUN + TURN) از Metered.ca.
+ * هر بار که تماس جدیدی شروع می‌شود این تابع صدا زده می‌شود تا credential
+ * همیشه معتبر و تازه باشد (credential های TURN معمولاً زمان‌دار هستند).
+ */
+async function fetchIceServers() {
+  try {
+    const response = await fetch(METERED_TURN_API_URL);
+    if (!response.ok) throw new Error(`Metered TURN API status ${response.status}`);
+    const iceServers = await response.json();
+    if (!Array.isArray(iceServers) || iceServers.length === 0) {
+      throw new Error("Metered TURN API returned an empty list");
     }
-  ],
-  bundlePolicy: "max-bundle",
-  rtcpMuxPolicy: "require",
-  iceCandidatePoolSize: 10
-};
+    return iceServers;
+  } catch (err) {
+    console.warn("گرفتن TURN credentials از Metered.ca شکست خورد، فقط STUN استفاده می‌شود:", err);
+    return FALLBACK_STUN_SERVERS;
+  }
+}
 
 $("voiceCallButton").addEventListener("click", () => startCall("voice"));
 $("videoCallButton").addEventListener("click", () => startCall("video"));
@@ -2562,7 +2561,13 @@ async function createPeerConnection() {
     }
   }
 
-  pc = new RTCPeerConnection({...RTC_CONFIG, iceCandidatePoolSize: 10});
+  const iceServers = await fetchIceServers();
+  pc = new RTCPeerConnection({
+    iceServers,
+    bundlePolicy: "max-bundle",
+    rtcpMuxPolicy: "require",
+    iceCandidatePoolSize: 10,
+  });
   const thisPc = pc;
 
   if (!localStream) throw new Error("Local media stream is missing");
